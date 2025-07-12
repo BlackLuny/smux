@@ -1,0 +1,21 @@
+[package]
+name = "smux"
+version = "0.1.0"
+authors = ["berry <iberryful@gmail.com>"]
+edition = "2024"
+license = "MIT"
+documentation = "https://docs.rs/"
+repository = "https://github.com/TODO"
+homepage = "https://github.com/TODO"
+description = """
+
+"""
+readme = "README.md"
+categories = ["development-tools"]
+keywords = []
+
+[dependencies]
+anyhow = "1.0.98"
+bytes = "1.10.1"
+thiserror = "2.0.12"
+tokio = { version = "1.46.1", features = ["rt", "rt-multi-thread", "tokio-macros", "net"] }
