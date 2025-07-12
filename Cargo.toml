@@ -5,11 +5,10 @@ authors = ["berry <iberryful@gmail.com>"]
 edition = "2024"
 license = "MIT"
 documentation = "https://docs.rs/"
-repository = "https://github.com/TODO"
-homepage = "https://github.com/TODO"
-description = """
+repository = "https://github.com/iberryful/smux"
+homepage = "https://github.com/iberryful/smux"
+description = "A smux implementation in Rust"
 
-"""
 readme = "README.md"
 categories = ["development-tools"]
 keywords = []
@@ -18,4 +17,9 @@ keywords = []
 anyhow = "1.0.98"
 bytes = "1.10.1"
 thiserror = "2.0.12"
-tokio = { version = "1.46.1", features = ["rt", "rt-multi-thread", "tokio-macros", "net"] }
+tokio = { version = "1.46.1", features = [
+    "rt",
+    "rt-multi-thread",
+    "tokio-macros",
+    "net",
+] }

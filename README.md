@@ -1,21 +1,11 @@
-![](https://github.com/tyrchen/rust-lib-template/workflows/build/badge.svg)
-
 # smux
 
-description of the crate
+A rust implementation of [smux](https://github.com/xtaci/smux/tree/master)
 
-## How to use it
 
-```bash
-$ cargo generate --git https://github.com/tyrchen/rust-lib-template
-```
-
-Have fun with this crate!
 
 ## License
 
 This project is distributed under the terms of MIT.
 
 See [LICENSE](LICENSE.md) for details.
-
-Copyright 2025 Tyr Chen
