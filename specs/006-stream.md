@@ -18,12 +18,13 @@ Key responsibilities of a `Stream`:
 ```rust
 pub struct Stream {
     id: u32,
-    // A weak reference to the session to avoid reference cycles.
-    session: Weak<SessionInner>,
-    // Buffer for incoming data.
-    read_buffer: Mutex<VecDeque<Bytes>>,
-    // Notifies waiting read calls that new data has arrived or the stream has closed.
-    read_notifier: Notify,
+    // Receives Frames from the session's recv_loop.
+    frame_rx: mpsc::Receiver<Frame>,
+    // Sends Frames to the session's send_loop. This is a clone of the session's global send channel.
+    frame_tx: mpsc::Sender<Frame>,
+    // A buffer for data that has been received from the channel but not yet read by the application.
+    // This is needed because a read might not consume a full `Bytes` chunk.
+    read_buffer: VecDeque<Bytes>,
     // Set when a FIN frame is received, indicating the peer will send no more data.
     is_read_closed: AtomicBool,
     // Set when the stream is closed for writing.
@@ -36,35 +37,36 @@ pub struct Stream {
 
 ## 3. Read Logic
 
-The `AsyncRead` implementation will read from the `read_buffer`.
+The `AsyncRead` implementation translates the incoming `Frame` stream into a simple byte stream for the application.
 
 ```mermaid
 graph TD
-    A[AsyncRead::poll_read()] --> B{Lock read_buffer};
-    B --> C{Buffer has data?};
-    C -- Yes --> D[Copy data to user buffer];
-    D --> E[Update flow control window];
-    E --> F[Return Poll::Ready(Ok(n))];
+    A[AsyncRead::poll_read()] --> B{read_buffer has data?};
+    B -- Yes --> C[Copy data to user & return Ready(Ok(n))];
 
-    C -- No --> G{Is stream read-closed?};
-    G -- Yes --> H[Return Poll::Ready(Ok(0)) - EOF];
-    G -- No --> I[Wait on read_notifier];
-    I --> J[Return Poll::Pending];
+    B -- No --> D{Poll frame_rx channel};
+    D -- Pending --> E[Return Pending];
+    D -- Closed --> F{Is buffer empty?};
+    F -- Yes --> G[Return Ready(Ok(0)) - EOF];
+    F -- No --> B;
 
-    subgraph "Session's recv_loop"
-        K[Receives PSH frame] --> L[Pushes data to read_buffer];
-        L --> M[Calls read_notifier.notify_one()];
-    end
-
-    M --> I;
+    D -- Ready(Some(frame)) --> H{match frame.cmd};
+    H -- PSH --> I[Push data to read_buffer];
+    I --> B;
+    H -- FIN --> J[Mark as read-closed & notify];
+    J --> F;
+    H -- UPD --> K[Update send window];
+    K --> D; // Loop to process next frame
 ```
 
-1.  **`poll_read`** is called on the `Stream`.
-2.  It acquires a lock on the `read_buffer`.
-3.  If the buffer contains data, it's copied to the user-provided buffer. The number of bytes copied is returned. For v2, an `UPD` frame might be sent to the peer to update the send window.
-4.  If the buffer is empty, the task registers with the `read_notifier` and returns `Poll::Pending`.
-5.  When the `Session`'s `recv_loop` receives a `PSH` frame for this stream, it pushes the data into the `read_buffer` and calls `read_notifier.notify_one()`, waking up the waiting read task.
-6.  If the stream has been read-closed (a `FIN` was received), `poll_read` on an empty buffer will return `Ok(0)`, signaling EOF.
+1.  **`poll_read`** is called. It first checks if the `read_buffer` already contains data. If so, it copies it to the user's buffer and returns `Poll::Ready`.
+2.  If the `read_buffer` is empty, the function begins to process incoming frames by polling the `frame_rx` channel in a loop.
+3.  If the channel is `Pending`, the current task is parked and will be woken when a new frame arrives.
+4.  If the channel returns a `Frame`, the function inspects the frame's command:
+    *   **`Command::Psh`**: The data payload from the frame is pushed to the back of the `read_buffer`. The loop is broken, and control returns to step 1, which will now find data in the buffer.
+    *   **`Command::Fin`**: The stream's `is_read_closed` flag is set. Any subsequent poll on an empty buffer will result in EOF.
+    *   **`Command::Upd`**: The stream's internal state for flow control is updated. The loop continues to poll for more frames.
+5.  If the channel is closed, it means the `Session` has shut down. `poll_read` will return EOF once the `read_buffer` is fully drained.
 
 ## 4. Write Logic
 
@@ -83,13 +85,13 @@ graph TD
 1.  **`poll_write`** is called with a buffer of data to write.
 2.  The data is chunked into frames, respecting `config.max_frame_size`.
 3.  For v2, it checks the available send window. If the window is too small, it will wait for an `UPD` frame from the peer.
-4.  A `PSH` frame is created for each chunk.
-5.  The frame is sent to the `Session`'s `send_loop` via its `mpsc` channel.
+4.  A `PSH` frame is created for each chunk with the stream's ID and data payload.
+5.  The frame is sent to the `Session`'s `send_loop` via the stream's `frame_tx` channel.
 6.  The number of bytes from the user's buffer that were successfully sent is returned.
 
 ## 5. Closing a Stream
 
-*   **Write-Side Close**: When `poll_shutdown` is called (or the `Stream` is dropped), a `FIN` frame is sent to the `Session`'s `send_loop`. This signals to the peer that no more data will be sent. The stream can still receive data.
+*   **Write-Side Close**: When `poll_shutdown` is called (or the `Stream` is dropped), a `FIN` frame is sent to the `Session`'s `send_loop` via the stream's `frame_tx` channel. This signals to the peer that no more data will be sent. The stream can still receive data.
 *   **Read-Side Close**: When the `Session` receives a `FIN` frame for this stream, it marks the stream as read-closed and notifies any pending read operations.
 *   **Full Close**: A stream is fully closed when it is both read-closed and write-closed. At this point, the `Session` removes it from its active streams map.
 

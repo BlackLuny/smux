@@ -23,14 +23,14 @@ pub struct Session<T> {
 
 // Internal state, shared among tasks
 struct SessionInner<T> {
-    // Framed transport for I/O
-    framed: Mutex<Framed<T, Codec>>,
-    // All active streams
-    streams: Mutex<HashMap<u32, Arc<Stream>>>,
+    // All active streams. The `mpsc::Sender` is used to push incoming Frames to the stream.
+    // DashMap provides lock-free reads and fine-grained locking for writes.
+    streams: DashMap<u32, mpsc::Sender<Frame>>,
     // Configuration
     config: Arc<Config>,
-    // Channel for accepting new streams
-    accept_tx: mpsc::Sender<Stream>,
+    // Sender part of the channel for new streams initiated by the peer.
+    // The `recv_loop` pushes to this, and `Session::accept_stream` pulls from the receiver.
+    incoming_streams_sender: mpsc::Sender<Stream>,
     // Next stream ID to use
     next_stream_id: AtomicU32,
     // Session close signal
@@ -39,15 +39,20 @@ struct SessionInner<T> {
 }
 ```
 
-This `Arc<Mutex<...>>` pattern allows safe, shared access to the session's state from multiple concurrent tasks.
+The use of `DashMap` for the streams collection provides significant performance benefits over `Mutex<HashMap>`:
+- **Lock-free reads**: Looking up streams doesn't require acquiring any locks
+- **Fine-grained locking**: Write operations only lock individual hash buckets, not the entire collection
+- **Better scalability**: Multiple threads can access different streams concurrently without contention
+
+This design allows the `recv_loop`, `send_loop`, and application threads to access different streams simultaneously with minimal blocking.
 
 ## 3. Concurrency Model
 
-The `Session`'s work is primarily done in two background tasks, which are spawned when a new `Session` is created.
+The `Session`'s work is primarily done in two background tasks. When a `Session` is created, the underlying transport is split into a read half and a write half. Each half is moved into its own dedicated task, eliminating the need for locks around the transport.
 
 ### 3.1. Receive Loop (`recv_loop`)
 
-This task owns the read half of the `Framed` transport. Its sole responsibility is to read incoming frames and dispatch them.
+This task owns the read half of the transport (a `futures::Stream`). Its sole responsibility is to read incoming frames and dispatch them.
 
 ```mermaid
 graph TD
@@ -71,7 +76,7 @@ graph TD
     K -- Not Found --> B;
 
     F --> M{Find Stream};
-    M -- Found --> N[Push Data to Stream Buffer];
+    M -- Found --> N[Send Frame to Stream's Channel];
     N --> B;
     M -- Not Found --> B;
 
@@ -86,8 +91,8 @@ graph TD
 To avoid contention on the write half of the transport, all outgoing frames are sent through a `mpsc` channel to a dedicated `send_loop` task. This task owns the write half of the `Framed` transport.
 
 *   **Input**: `mpsc::Receiver<Frame>`
-*   **Action**: Reads `Frame` from the channel and writes it to the `Framed` transport.
-*   **Benefit**: Serializes all writes to the underlying connection, simplifying locking and preventing interleaved writes from different streams.
+*   **Action**: Reads a `Frame` from the channel and writes it to its exclusive write half of the transport (a `futures::Sink`).
+*   **Benefit**: Serializes all writes to the underlying connection without contention, as it's the only task with write access.
 
 ## 4. Stream Lifecycle
 
@@ -95,7 +100,7 @@ To avoid contention on the write half of the transport, all outgoing frames are 
     1.  A new, unique stream ID is generated.
     2.  A `SYN` frame is created with this ID.
     3.  The frame is sent to the `send_loop`.
-    4.  A new `Stream` object is created and stored in the `streams` map.
+    4.  A new `Stream` object is created, given a clone of the session's `frame_tx` for sending frames.
     5.  The `Stream` is returned to the caller.
 
 *   **Accepting a Stream (`accept_stream`)**:

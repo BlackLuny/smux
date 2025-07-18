@@ -15,13 +15,21 @@ use smux::{Session, Config};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Session<T> {
-    /// Creates a new smux session.
+    /// Creates a new client-side smux session.
+    ///
+    /// Client sessions use odd-numbered stream IDs.
     ///
     /// - `conn`: The underlying transport, e.g., a TCP stream.
     /// - `config`: Session configuration.
-    /// - `is_client`: Specifies whether this is a client or server session,
-    ///   which determines the starting stream ID (odd for client, even for server).
-    pub fn new(conn: T, config: Config, is_client: bool) -> Self;
+    pub fn client(conn: T, config: Config) -> Self;
+
+    /// Creates a new server-side smux session.
+    ///
+    /// Server sessions use even-numbered stream IDs.
+    ///
+    /// - `conn`: The underlying transport, e.g., a TCP stream.
+    /// - `config`: Session configuration.
+    pub fn server(conn: T, config: Config) -> Self;
 }
 ```
 
