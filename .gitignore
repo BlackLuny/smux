@@ -3,3 +3,5 @@ Cargo.lock
 .vscode
 reference
 .claude
+fixtures/go_smux_echo_server
+fixtures/go_smux_echo_server.exe
