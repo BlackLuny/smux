@@ -40,6 +40,9 @@ pub enum SmuxError {
 
     #[error("Protocol violation: {0}")]
     ProtocolViolation(String),
+
+    #[error("Insufficient data for frame parsing")]
+    InsufficientData,
 }
 
 impl SmuxError {
@@ -54,7 +57,8 @@ impl SmuxError {
             SmuxError::SessionClosed
             | SmuxError::InvalidProtocol(_)
             | SmuxError::Config(_)
-            | SmuxError::ProtocolViolation(_) => false,
+            | SmuxError::ProtocolViolation(_)
+            | SmuxError::InsufficientData => false,
             SmuxError::FrameTooLarge { .. }
             | SmuxError::StreamNotFound(_)
             | SmuxError::StreamAlreadyExists(_)
