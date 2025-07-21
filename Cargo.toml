@@ -21,6 +21,12 @@ tokio = { version = "1.46.1", features = [
     "rt",
     "rt-multi-thread",
     "tokio-macros",
+    "macros",
     "net",
+    "sync",
+    "io-util",
 ] }
 tokio-util = { version = "0.7", features = ["codec"] }
+dashmap = "6.1.0"
+futures = "0.3"
+tracing = "0.1"
