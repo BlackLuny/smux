@@ -25,6 +25,7 @@ tokio = { version = "1.46.1", features = [
     "net",
     "sync",
     "io-util",
+    "time",
 ] }
 tokio-util = { version = "0.7", features = ["codec"] }
 dashmap = "6.1.0"
