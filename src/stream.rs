@@ -1,21 +1,19 @@
 use crate::{
-    Command,
     error::{Result, SmuxError},
     frame::Frame,
 };
 use bytes::Bytes;
 use std::{
-    collections::VecDeque,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Mutex, mpsc},
+    sync::mpsc,
 };
 
 /// A multiplexed stream within a smux session
@@ -27,35 +25,29 @@ pub struct Stream {
     stream_id: u32,
     /// Sends frames to the session's send_loop
     frame_tx: mpsc::Sender<Frame>,
-    /// Receives frames from the session's recv_loop
-    frame_rx: Arc<Mutex<mpsc::Receiver<Frame>>>,
-    /// Buffer for incoming data that hasn't been read yet
-    read_buffer: Arc<Mutex<VecDeque<Bytes>>>,
+    /// Receives incoming data chunks from the session
+    data_rx: mpsc::UnboundedReceiver<Bytes>,
+    /// A temporary buffer for when a user reads only part of a data chunk
+    current_chunk: Option<Bytes>,
     /// Set when a FIN frame is received (no more data from peer)
     is_read_closed: Arc<AtomicBool>,
     /// Set when the stream is closed for writing
     is_write_closed: Arc<AtomicBool>,
-    /// Per-stream window size for v2 flow control
-    window: Arc<AtomicU32>,
-    /// Waker for pending read operations
-    read_waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl Stream {
     pub(crate) fn new(
         stream_id: u32,
         frame_tx: mpsc::Sender<Frame>,
-        frame_rx: mpsc::Receiver<Frame>,
+        data_rx: mpsc::UnboundedReceiver<Bytes>,
     ) -> Self {
         Self {
             stream_id,
             frame_tx,
-            frame_rx: Arc::new(Mutex::new(frame_rx)),
-            read_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            data_rx,
+            current_chunk: None,
             is_read_closed: Arc::new(AtomicBool::new(false)),
             is_write_closed: Arc::new(AtomicBool::new(false)),
-            window: Arc::new(AtomicU32::new(65536)), // Default window size
-            read_waker: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -100,96 +92,40 @@ impl AsyncRead for Stream {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
-        // First, check if we have data in the read buffer
-        let mut read_buffer = match this.read_buffer.try_lock() {
-            Ok(buffer) => buffer,
-            Err(_) => {
-                // Buffer is locked, register waker and return pending
-                if let Ok(mut waker) = this.read_waker.try_lock() {
-                    *waker = Some(cx.waker().clone());
-                }
-                return Poll::Pending;
-            }
-        };
-
-        // Try to fill user buffer from our read buffer
-        let initial_filled = buf.filled().len();
-        while !read_buffer.is_empty() && buf.remaining() > 0 {
-            if let Some(bytes) = read_buffer.front_mut() {
-                let to_copy = std::cmp::min(bytes.len(), buf.remaining());
-                let data = bytes.split_to(to_copy);
+        // First, try to fulfill the read from any partially consumed chunk
+        if let Some(ref mut chunk) = this.current_chunk {
+            let to_copy = std::cmp::min(chunk.len(), buf.remaining());
+            if to_copy > 0 {
+                let data = chunk.split_to(to_copy);
                 buf.put_slice(&data);
 
-                // Remove empty bytes from front of queue
-                if bytes.is_empty() {
-                    read_buffer.pop_front();
+                // If chunk is now empty, remove it
+                if chunk.is_empty() {
+                    this.current_chunk = None;
                 }
+
+                return Poll::Ready(Ok(()));
             }
         }
 
-        // If we copied data to user buffer, return success
-        if buf.filled().len() > initial_filled {
-            return Poll::Ready(Ok(()));
-        }
+        // No current chunk or remaining buffer space, try to get a new chunk
+        match this.data_rx.poll_recv(cx) {
+            Poll::Ready(Some(mut chunk)) => {
+                let to_copy = std::cmp::min(chunk.len(), buf.remaining());
+                if to_copy > 0 {
+                    let data = chunk.split_to(to_copy);
+                    buf.put_slice(&data);
 
-        // No data in buffer, check if read is closed
-        if this.is_read_closed.load(Ordering::Relaxed) {
-            // Return EOF
-            return Poll::Ready(Ok(()));
-        }
-
-        drop(read_buffer);
-
-        // Try to process new frames
-        let frame_rx = Arc::clone(&this.frame_rx);
-        let read_buffer = Arc::clone(&this.read_buffer);
-        let is_read_closed = Arc::clone(&this.is_read_closed);
-        let read_waker = Arc::clone(&this.read_waker);
-
-        // Poll the frame receiver
-        let mut frame_rx_guard = match frame_rx.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                // Frame receiver is locked, register waker and return pending
-                if let Ok(mut waker) = read_waker.try_lock() {
-                    *waker = Some(cx.waker().clone());
-                }
-                return Poll::Pending;
-            }
-        };
-
-        match frame_rx_guard.poll_recv(cx) {
-            Poll::Ready(Some(frame)) => {
-                drop(frame_rx_guard);
-
-                // Process the frame
-                match frame.cmd {
-                    Command::Psh => {
-                        if !frame.data.is_empty() {
-                            if let Ok(mut buffer) = read_buffer.try_lock() {
-                                buffer.push_back(frame.data);
-                            }
-                        }
-                        // Wake up this task to retry reading
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
+                    // Store remainder if any
+                    if !chunk.is_empty() {
+                        this.current_chunk = Some(chunk);
                     }
-                    Command::Fin => {
-                        is_read_closed.store(true, Ordering::Relaxed);
-                        // Return EOF
-                        Poll::Ready(Ok(()))
-                    }
-                    Command::Upd { window, .. } => {
-                        this.window.store(window, Ordering::Relaxed);
-                        // Continue polling for more frames
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                    _ => {
-                        // Ignore other frame types, continue polling
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
+
+                    Poll::Ready(Ok(()))
+                } else {
+                    // No buffer space, store the chunk for later
+                    this.current_chunk = Some(chunk);
+                    Poll::Ready(Ok(()))
                 }
             }
             Poll::Ready(None) => {
@@ -197,11 +133,12 @@ impl AsyncRead for Stream {
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => {
-                // No frames available, register waker
-                if let Ok(mut waker) = read_waker.try_lock() {
-                    *waker = Some(cx.waker().clone());
+                // No data available, check if read is closed
+                if this.is_read_closed.load(Ordering::Relaxed) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
                 }
-                Poll::Pending
             }
         }
     }
@@ -301,14 +238,15 @@ impl Drop for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Command;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn test_stream_creation() {
         let (frame_tx, _) = mpsc::channel(1);
-        let (_, frame_rx) = mpsc::channel(1);
+        let (_, data_rx) = mpsc::unbounded_channel();
 
-        let stream = Stream::new(123, frame_tx, frame_rx);
+        let stream = Stream::new(123, frame_tx, data_rx);
         assert_eq!(stream.stream_id(), 123);
         assert!(!stream.is_read_closed());
         assert!(!stream.is_write_closed());
@@ -316,16 +254,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_read_with_psh_frame() {
+    async fn test_stream_read_with_data() {
         let (frame_tx, _) = mpsc::channel(1);
-        let (incoming_tx, frame_rx) = mpsc::channel(1);
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
 
-        let mut stream = Stream::new(123, frame_tx, frame_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx);
 
-        // Send a PSH frame with data
+        // Send data directly to the data channel
         let test_data = Bytes::from("hello world");
-        let psh_frame = Frame::new_psh(1, 123, test_data.clone());
-        incoming_tx.send(psh_frame).await.unwrap();
+        data_tx.send(test_data.clone()).unwrap();
 
         // Read from stream
         let mut buf = [0u8; 20];
@@ -335,29 +272,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_read_with_fin_frame() {
+    async fn test_stream_read_eof() {
         let (frame_tx, _) = mpsc::channel(1);
-        let (incoming_tx, frame_rx) = mpsc::channel(1);
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
 
-        let mut stream = Stream::new(123, frame_tx, frame_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx);
 
-        // Send a FIN frame
-        let fin_frame = Frame::new_fin(1, 123);
-        incoming_tx.send(fin_frame).await.unwrap();
+        // Close the data channel to simulate EOF
+        drop(data_tx);
 
         // Read should return 0 (EOF)
         let mut buf = [0u8; 20];
         let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(n, 0);
-        assert!(stream.is_read_closed());
     }
 
     #[tokio::test]
     async fn test_stream_write() {
         let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, incoming_rx) = mpsc::channel(1);
+        let (_, data_rx) = mpsc::unbounded_channel();
 
-        let mut stream = Stream::new(123, frame_tx, incoming_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx);
 
         // Write some data
         let test_data = b"hello world";
@@ -374,9 +309,9 @@ mod tests {
     #[tokio::test]
     async fn test_stream_shutdown() {
         let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, incoming_rx) = mpsc::channel(1);
+        let (_, data_rx) = mpsc::unbounded_channel();
 
-        let mut stream = Stream::new(123, frame_tx, incoming_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx);
 
         // Shutdown the stream
         stream.shutdown().await.unwrap();
@@ -391,9 +326,9 @@ mod tests {
     #[tokio::test]
     async fn test_stream_close() {
         let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, incoming_rx) = mpsc::channel(1);
+        let (_, data_rx) = mpsc::unbounded_channel();
 
-        let mut stream = Stream::new(123, frame_tx, incoming_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx);
 
         // Close the stream
         stream.close().await.unwrap();
@@ -408,19 +343,16 @@ mod tests {
     #[tokio::test]
     async fn test_stream_multiple_reads() {
         let (frame_tx, _) = mpsc::channel(1);
-        let (incoming_tx, frame_rx) = mpsc::channel(10);
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
 
-        let mut stream = Stream::new(123, frame_tx, frame_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx);
 
-        // Send multiple PSH frames
+        // Send multiple data chunks
         let data1 = Bytes::from("hello ");
         let data2 = Bytes::from("world");
 
-        let psh1 = Frame::new_psh(1, 123, data1.clone());
-        let psh2 = Frame::new_psh(1, 123, data2.clone());
-
-        incoming_tx.send(psh1).await.unwrap();
-        incoming_tx.send(psh2).await.unwrap();
+        data_tx.send(data1).unwrap();
+        data_tx.send(data2).unwrap();
 
         // Read all data
         let mut buf = [0u8; 20];
@@ -436,10 +368,10 @@ mod tests {
     #[tokio::test]
     async fn test_stream_drop_sends_fin() {
         let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, incoming_rx) = mpsc::channel(1);
+        let (_, data_rx) = mpsc::unbounded_channel();
 
         {
-            let _stream = Stream::new(123, frame_tx, incoming_rx);
+            let _stream = Stream::new(123, frame_tx, data_rx);
             // Stream is dropped here
         }
 

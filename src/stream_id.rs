@@ -17,21 +17,16 @@ impl StreamIdGenerator {
     }
 
     pub fn next(&self) -> Result<u32> {
-        let current = self.next_id.load(Ordering::Relaxed);
+        let next_id = self.next_id.fetch_add(2, Ordering::Relaxed);
 
-        // Check for overflow before incrementing
-        if current > u32::MAX - 2 {
+        // Check for overflow after the increment
+        if next_id > u32::MAX - 2 {
             return Err(SmuxError::ProtocolViolation(
                 "Stream ID overflow - session should be restarted".to_string(),
             ));
         }
 
-        let next = current + 2;
-
-        // Store the next ID for the following call
-        self.next_id.store(next, Ordering::Relaxed);
-
-        Ok(current)
+        Ok(next_id)
     }
 
     pub fn validate_peer_stream_id(&self, stream_id: u32) -> Result<()> {
@@ -212,6 +207,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_id_generation() {
+        use std::collections::HashSet;
         use std::sync::Arc;
         use std::thread;
 
@@ -219,11 +215,12 @@ mod tests {
         let mut handles = vec![];
 
         // Spawn multiple threads to generate IDs concurrently
-        for _ in 0..10 {
+        // Use more threads and more iterations to stress test
+        for _ in 0..20 {
             let generator_clone = Arc::clone(&generator);
             let handle = thread::spawn(move || {
                 let mut ids = Vec::new();
-                for _ in 0..10 {
+                for _ in 0..50 {
                     if let Ok(id) = generator_clone.next() {
                         ids.push(id);
                     }
@@ -241,14 +238,115 @@ mod tests {
         }
 
         // Verify all IDs are unique and odd (client-initiated)
-        all_ids.sort();
-        all_ids.dedup();
+        let mut unique_ids = HashSet::new();
+        let mut duplicates = Vec::new();
 
         for id in &all_ids {
-            assert_eq!(id % 2, 1, "All client IDs should be odd");
+            assert_eq!(
+                id % 2,
+                1,
+                "All client IDs should be odd, found even ID: {id}"
+            );
+            if !unique_ids.insert(*id) {
+                duplicates.push(*id);
+            }
         }
 
-        // Should have generated unique IDs
-        assert!(all_ids.len() > 50, "Should generate many unique IDs");
+        // This is the critical test - no duplicates should exist
+        assert!(duplicates.is_empty(), "Found duplicate IDs: {duplicates:?}");
+
+        // Should have generated many unique IDs
+        assert!(
+            all_ids.len() >= 1000,
+            "Should generate at least 1000 IDs, got {}",
+            all_ids.len()
+        );
+        assert_eq!(unique_ids.len(), all_ids.len(), "All IDs should be unique");
+
+        // Verify IDs are in expected sequence (accounting for concurrency)
+        let mut sorted_ids: Vec<_> = unique_ids.into_iter().collect();
+        sorted_ids.sort();
+
+        // All IDs should be odd and start from 1
+        assert_eq!(sorted_ids[0], 1, "First ID should be 1");
+        for id in &sorted_ids {
+            assert_eq!(id % 2, 1, "All IDs should be odd");
+        }
+    }
+
+    #[test]
+    fn test_concurrent_client_server_id_generation() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let client_generator = Arc::new(StreamIdGenerator::new(true));
+        let server_generator = Arc::new(StreamIdGenerator::new(false));
+        let mut handles = vec![];
+
+        // Test both client and server generators concurrently
+        for _ in 0..10 {
+            let client_gen = Arc::clone(&client_generator);
+            let handle = thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..25 {
+                    if let Ok(id) = client_gen.next() {
+                        ids.push(id);
+                    }
+                }
+                ids
+            });
+            handles.push(handle);
+
+            let server_gen = Arc::clone(&server_generator);
+            let handle = thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..25 {
+                    if let Ok(id) = server_gen.next() {
+                        ids.push(id);
+                    }
+                }
+                ids
+            });
+            handles.push(handle);
+        }
+
+        // Collect all generated IDs
+        let mut client_ids = Vec::new();
+        let mut server_ids = Vec::new();
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let ids = handle.join().unwrap();
+            if i % 2 == 0 {
+                client_ids.extend(ids);
+            } else {
+                server_ids.extend(ids);
+            }
+        }
+
+        // Verify client IDs are unique and odd
+        let mut unique_client_ids = HashSet::new();
+        for id in &client_ids {
+            assert_eq!(id % 2, 1, "Client ID should be odd: {id}");
+            assert!(unique_client_ids.insert(*id), "Duplicate client ID: {id}");
+        }
+
+        // Verify server IDs are unique and even
+        let mut unique_server_ids = HashSet::new();
+        for id in &server_ids {
+            assert_eq!(id % 2, 0, "Server ID should be even: {id}");
+            assert!(unique_server_ids.insert(*id), "Duplicate server ID: {id}");
+        }
+
+        // Verify no overlap between client and server IDs
+        for client_id in &client_ids {
+            assert!(
+                !server_ids.contains(client_id),
+                "Client/server ID overlap: {client_id}"
+            );
+        }
+
+        assert!(client_ids.len() >= 250, "Should generate many client IDs");
+        assert!(server_ids.len() >= 250, "Should generate many server IDs");
     }
 }

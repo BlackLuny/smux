@@ -7,6 +7,7 @@ use crate::{
     stream::Stream,
     stream_id::StreamIdGenerator,
 };
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -15,6 +16,15 @@ use tokio::{
     sync::{Notify, mpsc},
 };
 use tokio_util::codec::Framed;
+
+/// Stream state tracked by the session for each active stream
+#[derive(Debug)]
+struct StreamState {
+    /// Sender for data chunks to the stream
+    data_tx: mpsc::UnboundedSender<Bytes>,
+    /// Atomic flag for read closed state
+    is_read_closed: Arc<AtomicBool>,
+}
 
 /// A multiplexed session that manages multiple streams over a single connection
 #[derive(Debug)]
@@ -25,8 +35,8 @@ pub struct Session<T> {
 /// Internal session state shared between tasks
 #[derive(Debug)]
 struct SessionInner<T> {
-    /// Active streams mapped by stream ID to their frame sender
-    streams: DashMap<u32, mpsc::Sender<Frame>>,
+    /// Active streams mapped by stream ID to their state
+    streams: DashMap<u32, StreamState>,
     /// Session configuration
     config: Arc<Config>,
     /// Sender for accepting new streams initiated by peer
@@ -122,14 +132,20 @@ where
         // Generate new stream ID
         let stream_id = self.inner.stream_id_gen.next()?;
 
-        // Create frame channel for this stream
-        let (stream_frame_tx, stream_frame_rx) = mpsc::channel(16);
+        // Create data channel for this stream
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+
+        // Create stream state
+        let stream_state = StreamState {
+            data_tx,
+            is_read_closed: Arc::new(AtomicBool::new(false)),
+        };
 
         // Create stream
-        let stream = Stream::new(stream_id, self.inner.frame_tx.clone(), stream_frame_rx);
+        let stream = Stream::new(stream_id, self.inner.frame_tx.clone(), data_rx);
 
         // Add to streams map
-        self.inner.streams.insert(stream_id, stream_frame_tx);
+        self.inner.streams.insert(stream_id, stream_state);
 
         // Send SYN frame
         let syn_frame = Frame::new_syn(self.inner.config.version, stream_id);
@@ -285,14 +301,20 @@ where
         return Err(SmuxError::StreamAlreadyExists(stream_id));
     }
 
-    // Create frame channel for this stream
-    let (stream_frame_tx, stream_frame_rx) = mpsc::channel(16);
+    // Create data channel for this stream
+    let (data_tx, data_rx) = mpsc::unbounded_channel();
+
+    // Create stream state
+    let stream_state = StreamState {
+        data_tx,
+        is_read_closed: Arc::new(AtomicBool::new(false)),
+    };
 
     // Create stream
-    let stream = Stream::new(stream_id, inner.frame_tx.clone(), stream_frame_rx);
+    let stream = Stream::new(stream_id, inner.frame_tx.clone(), data_rx);
 
     // Add to streams map
-    inner.streams.insert(stream_id, stream_frame_tx);
+    inner.streams.insert(stream_id, stream_state);
 
     // Send to accept channel
     if (inner.incoming_streams_tx.send(stream).await).is_err() {
@@ -311,10 +333,13 @@ where
 {
     let stream_id = frame.stream_id;
 
-    // Find and remove the stream
-    if let Some((_, stream_tx)) = inner.streams.remove(&stream_id) {
-        // Send FIN frame to stream (if channel is still open)
-        let _ = stream_tx.send(frame).await;
+    // Find the stream and mark it as read-closed
+    if let Some((_, stream_state)) = inner.streams.remove(&stream_id) {
+        stream_state
+            .is_read_closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Close the data channel to signal EOF to the stream
+        drop(stream_state.data_tx);
     }
 
     Ok(())
@@ -327,11 +352,11 @@ where
 {
     let stream_id = frame.stream_id;
 
-    // Find the stream and forward the frame
-    if let Some(stream_tx) = inner.streams.get(&stream_id) {
-        if (stream_tx.send(frame).await).is_err() {
+    // Find the stream and send data to it
+    if let Some(stream_state) = inner.streams.get(&stream_id) {
+        if !frame.data.is_empty() && stream_state.data_tx.send(frame.data).is_err() {
             // Stream receiver is closed, remove from map
-            drop(stream_tx);
+            drop(stream_state);
             inner.streams.remove(&stream_id);
         }
     }
@@ -341,19 +366,18 @@ where
 }
 
 /// Handle UPD frame (flow control update)
-async fn handle_upd_frame<T>(frame: Frame, inner: &Arc<SessionInner<T>>) -> Result<()>
+async fn handle_upd_frame<T>(frame: Frame, _inner: &Arc<SessionInner<T>>) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
-    let stream_id = frame.stream_id;
+    let _stream_id = frame.stream_id;
 
-    // Find the stream and forward the frame
-    if let Some(stream_tx) = inner.streams.get(&stream_id) {
-        if (stream_tx.send(frame).await).is_err() {
-            // Stream receiver is closed, remove from map
-            drop(stream_tx);
-            inner.streams.remove(&stream_id);
-        }
+    // Extract window from UPD frame
+    if let Command::Upd { .. } = frame.cmd {
+        // For now, we just ignore the UPD frame since our simple implementation
+        // doesn't implement flow control yet. In a full implementation, we would
+        // update the stream's send window and potentially wake up blocked writers.
+        // TODO: Implement proper flow control
     }
     // If stream not found, ignore the frame
 

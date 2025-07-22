@@ -74,6 +74,8 @@ This design eliminates the need for `Mutex`, `VecDeque`, and `AtomicWaker` for t
 
 To prevent uncontrolled memory growth, we will use a **bounded `mpsc` channel**. The channel's capacity will be determined by the `Config::max_stream_buffer` setting. This provides a crucial backpressure mechanism, ensuring that a slow stream consumer cannot cause the session to run out of memory.
 
+**UPDATE**: We will switch from bounded to unbounded `mpsc` channels to eliminate potential blocking and improve performance. This change removes the need for backpressure handling at the channel level, allowing the system to process frames more efficiently without blocking on channel capacity limits.
+
 ### 3.3. Refactoring `poll_write`
 
 The `poll_write` logic remains largely the same, as it communicates with the session's `send_loop` via a channel (`frame_tx`), which is already a lock-free mechanism. However, we will integrate configuration properly.
@@ -101,10 +103,11 @@ When a frame arrives in `recv_loop`, the session will:
 1.  **Introduce `AtomicWaker`:** Add a dependency on the `futures-util` crate for `AtomicWaker` or implement a simple version.
 2.  **Refactor `Stream` and `StreamState`:** Split the `Stream` struct as described above.
 3.  **Update `Session`:** Modify `SessionInner` to manage `StreamState` objects.
-4.  **Rewrite `poll_read`:** Implement the simplified, lock-free `poll_read` logic.
-5.  **Update `recv_loop`:** Modify the frame handling logic in `session.rs` to interact with the new `StreamState`.
-6.  **Integrate Configuration:** Plumb the `Config` object into the `Stream` and use it for values like `max_frame_size` and protocol version.
-7.  **Verify Tests:** Ensure all existing tests pass and add new tests for the refactored logic.
+4.  **Switch to unbounded channels:** Replace all `mpsc::channel()` calls with `mpsc::unbounded_channel()` to eliminate blocking on channel capacity.
+5.  **Rewrite `poll_read`:** Implement the simplified, lock-free `poll_read` logic.
+6.  **Update `recv_loop`:** Modify the frame handling logic in `session.rs` to interact with the new `StreamState`.
+7.  **Integrate Configuration:** Plumb the `Config` object into the `Stream` and use it for values like `max_frame_size` and protocol version.
+8.  **Verify Tests:** Ensure all existing tests pass and add new tests for the refactored logic.
 
 ## 5. Benefits of Refactoring
 
@@ -112,3 +115,4 @@ When a frame arrives in `recv_loop`, the session will:
 *   **Simplified Code:** The `poll_read` logic will be more straightforward and easier to reason about.
 *   **Reduced Risk of Deadlocks:** Removing mutexes eliminates a common source of deadlocks.
 *   **Better Scalability:** The lock-free design will scale better with the number of cores and streams.
+*   **Eliminated Channel Blocking:** Using unbounded channels removes potential blocking points where producers wait for channel capacity, further improving performance and reducing latency.
