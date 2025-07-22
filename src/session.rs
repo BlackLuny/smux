@@ -5,12 +5,14 @@ use crate::{
     error::{Result, SmuxError},
     frame::Frame,
     stream::Stream,
-    stream_id::StreamIdGenerator,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Notify,
@@ -43,8 +45,10 @@ struct SessionInner<T> {
     incoming_streams_tx: flume::Sender<Stream>,
     /// Receiver for accepting new streams (used by accept_stream)
     incoming_streams_rx: flume::Receiver<Stream>,
-    /// Stream ID generator
-    stream_id_gen: StreamIdGenerator,
+    /// Next stream ID to be used
+    next_stream_id: AtomicU32,
+    /// True if this is the client side of the connection
+    is_client: bool,
     /// Sender for outgoing frames (to send_loop)
     frame_tx: flume::Sender<Frame>,
     /// Session shutdown signal
@@ -88,13 +92,17 @@ where
         let (frame_tx, frame_rx) = flume::bounded(config.max_receive_buffer);
         let (incoming_streams_tx, incoming_streams_rx) = flume::bounded(16);
 
+        // Initial stream ID depends on whether we are client or server
+        let initial_id = if is_client { 1 } else { 2 };
+
         // Create session inner
         let inner = Arc::new(SessionInner {
             streams: DashMap::new(),
             config: Arc::clone(&config),
             incoming_streams_tx,
             incoming_streams_rx,
-            stream_id_gen: StreamIdGenerator::new(is_client),
+            next_stream_id: AtomicU32::new(initial_id),
+            is_client,
             frame_tx,
             die: Arc::new(Notify::new()),
             closed: AtomicBool::new(false),
@@ -130,7 +138,7 @@ where
         }
 
         // Generate new stream ID
-        let stream_id = self.inner.stream_id_gen.next()?;
+        let stream_id = self.inner.next_stream_id()?;
 
         // Create data channel for this stream
         let (data_tx, data_rx) = flume::unbounded();
@@ -189,6 +197,35 @@ where
     /// Check if the session is closed
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl<T> SessionInner<T> {
+    /// Get the next available stream ID
+    fn next_stream_id(&self) -> Result<u32> {
+        let current = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
+        if current > u32::MAX - 2 {
+            return Err(SmuxError::ProtocolViolation(
+                "Stream ID overflow - session should be restarted".to_string(),
+            ));
+        }
+        Ok(current)
+    }
+
+    /// Validate a stream ID initiated by the peer
+    fn validate_peer_stream_id(&self, stream_id: u32) -> Result<()> {
+        if stream_id == 0 {
+            return Err(SmuxError::InvalidStreamId(stream_id));
+        }
+
+        let expected_parity = if self.is_client { 0 } else { 1 };
+        let actual_parity = stream_id % 2;
+
+        if actual_parity != expected_parity {
+            return Err(SmuxError::InvalidStreamId(stream_id));
+        }
+
+        Ok(())
     }
 }
 
@@ -299,7 +336,7 @@ where
     let stream_id = frame.stream_id;
 
     // Validate peer stream ID
-    inner.stream_id_gen.validate_peer_stream_id(stream_id)?;
+    inner.validate_peer_stream_id(stream_id)?;
 
     // Check if stream already exists
     if inner.streams.contains_key(&stream_id) {
@@ -467,5 +504,135 @@ mod tests {
         assert_eq!(stream1.stream_id(), 1);
         assert_eq!(stream2.stream_id(), 3);
         assert_eq!(stream3.stream_id(), 5);
+    }
+
+    #[test]
+    fn test_client_stream_id_generation() {
+        let inner = SessionInner::<tokio::io::DuplexStream> {
+            streams: DashMap::new(),
+            config: Arc::new(test_config()),
+            incoming_streams_tx: flume::bounded(1).0,
+            incoming_streams_rx: flume::bounded(1).1,
+            next_stream_id: AtomicU32::new(1),
+            is_client: true,
+            frame_tx: flume::bounded(1).0,
+            die: Arc::new(Notify::new()),
+            closed: AtomicBool::new(false),
+            _transport: std::marker::PhantomData,
+        };
+
+        assert_eq!(inner.next_stream_id().unwrap(), 1);
+        assert_eq!(inner.next_stream_id().unwrap(), 3);
+        assert_eq!(inner.next_stream_id().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_server_stream_id_generation() {
+        let inner = SessionInner::<tokio::io::DuplexStream> {
+            streams: DashMap::new(),
+            config: Arc::new(test_config()),
+            incoming_streams_tx: flume::bounded(1).0,
+            incoming_streams_rx: flume::bounded(1).1,
+            next_stream_id: AtomicU32::new(2),
+            is_client: false,
+            frame_tx: flume::bounded(1).0,
+            die: Arc::new(Notify::new()),
+            closed: AtomicBool::new(false),
+            _transport: std::marker::PhantomData,
+        };
+
+        assert_eq!(inner.next_stream_id().unwrap(), 2);
+        assert_eq!(inner.next_stream_id().unwrap(), 4);
+        assert_eq!(inner.next_stream_id().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_stream_id_overflow() {
+        let inner = SessionInner::<tokio::io::DuplexStream> {
+            streams: DashMap::new(),
+            config: Arc::new(test_config()),
+            incoming_streams_tx: flume::bounded(1).0,
+            incoming_streams_rx: flume::bounded(1).1,
+            next_stream_id: AtomicU32::new(u32::MAX - 1),
+            is_client: true,
+            frame_tx: flume::bounded(1).0,
+            die: Arc::new(Notify::new()),
+            closed: AtomicBool::new(false),
+            _transport: std::marker::PhantomData,
+        };
+        assert!(inner.next_stream_id().is_err());
+    }
+
+    #[test]
+    fn test_peer_stream_id_validation() {
+        let client_inner = SessionInner::<tokio::io::DuplexStream> {
+            streams: DashMap::new(),
+            config: Arc::new(test_config()),
+            incoming_streams_tx: flume::bounded(1).0,
+            incoming_streams_rx: flume::bounded(1).1,
+            next_stream_id: AtomicU32::new(1),
+            is_client: true,
+            frame_tx: flume::bounded(1).0,
+            die: Arc::new(Notify::new()),
+            closed: AtomicBool::new(false),
+            _transport: std::marker::PhantomData,
+        };
+        let server_inner = SessionInner::<tokio::io::DuplexStream> {
+            streams: DashMap::new(),
+            config: Arc::new(test_config()),
+            incoming_streams_tx: flume::bounded(1).0,
+            incoming_streams_rx: flume::bounded(1).1,
+            next_stream_id: AtomicU32::new(2),
+            is_client: false,
+            frame_tx: flume::bounded(1).0,
+            die: Arc::new(Notify::new()),
+            closed: AtomicBool::new(false),
+            _transport: std::marker::PhantomData,
+        };
+
+        assert!(client_inner.validate_peer_stream_id(2).is_ok());
+        assert!(client_inner.validate_peer_stream_id(1).is_err());
+        assert!(server_inner.validate_peer_stream_id(1).is_ok());
+        assert!(server_inner.validate_peer_stream_id(2).is_err());
+        assert!(client_inner.validate_peer_stream_id(0).is_err());
+        assert!(server_inner.validate_peer_stream_id(0).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_id_generation() {
+        use std::collections::HashSet;
+        let (client_transport, _server_transport) = tokio::io::duplex(1024);
+        let session = Session::client(client_transport, test_config())
+            .await
+            .unwrap();
+        let session_inner = Arc::clone(&session.inner);
+
+        let mut handles = vec![];
+        for _ in 0..20 {
+            let inner = Arc::clone(&session_inner);
+            let handle = tokio::spawn(async move {
+                let mut ids = Vec::new();
+                for _ in 0..50 {
+                    if let Ok(id) = inner.next_stream_id() {
+                        ids.push(id);
+                    }
+                }
+                ids
+            });
+            handles.push(handle);
+        }
+
+        let mut all_ids = Vec::new();
+        for handle in handles {
+            all_ids.extend(handle.await.unwrap());
+        }
+
+        let mut unique_ids = HashSet::new();
+        for id in &all_ids {
+            assert_eq!(*id % 2, 1, "Client ID should be odd");
+            assert!(unique_ids.insert(*id), "Duplicate client ID found");
+        }
+        assert_eq!(unique_ids.len(), all_ids.len());
+        assert!(all_ids.len() >= 1000);
     }
 }
