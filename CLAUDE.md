@@ -56,3 +56,4 @@ The Session spawns two main tasks:
 - Library is currently minimal (basic test in lib.rs) - implementation in progress per task files
 - Follow specs under specs/
 - Tasks are described under tasks/
+- Should run make check and make test after finish a task. Make sure test pass rate is 100%
