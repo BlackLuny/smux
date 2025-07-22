@@ -33,6 +33,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 dashmap = "6.1.0"
 futures = "0.3"
 tracing = "0.1"
+flume = { version = "0.11.1", features = ["select", "async"] }
 
 [dev-dependencies]
 futures = "0.3"

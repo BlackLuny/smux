@@ -13,7 +13,7 @@ use futures::{SinkExt, StreamExt};
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Notify, mpsc},
+    sync::Notify,
 };
 use tokio_util::codec::Framed;
 
@@ -21,7 +21,7 @@ use tokio_util::codec::Framed;
 #[derive(Debug)]
 struct StreamState {
     /// Sender for data chunks to the stream
-    data_tx: mpsc::UnboundedSender<Bytes>,
+    data_tx: flume::Sender<Bytes>,
     /// Atomic flag for read closed state
     is_read_closed: Arc<AtomicBool>,
 }
@@ -40,13 +40,13 @@ struct SessionInner<T> {
     /// Session configuration
     config: Arc<Config>,
     /// Sender for accepting new streams initiated by peer
-    incoming_streams_tx: mpsc::Sender<Stream>,
+    incoming_streams_tx: flume::Sender<Stream>,
     /// Receiver for accepting new streams (used by accept_stream)
-    incoming_streams_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Stream>>>,
+    incoming_streams_rx: flume::Receiver<Stream>,
     /// Stream ID generator
     stream_id_gen: StreamIdGenerator,
     /// Sender for outgoing frames (to send_loop)
-    frame_tx: mpsc::Sender<Frame>,
+    frame_tx: flume::Sender<Frame>,
     /// Session shutdown signal
     die: Arc<Notify>,
     /// Flag to track if session is closed
@@ -85,15 +85,15 @@ where
         let (sink, stream) = framed.split();
 
         // Create channels
-        let (frame_tx, frame_rx) = mpsc::channel(config.max_receive_buffer);
-        let (incoming_streams_tx, incoming_streams_rx) = mpsc::channel(16);
+        let (frame_tx, frame_rx) = flume::bounded(config.max_receive_buffer);
+        let (incoming_streams_tx, incoming_streams_rx) = flume::bounded(16);
 
         // Create session inner
         let inner = Arc::new(SessionInner {
             streams: DashMap::new(),
             config: Arc::clone(&config),
             incoming_streams_tx,
-            incoming_streams_rx: Arc::new(tokio::sync::Mutex::new(incoming_streams_rx)),
+            incoming_streams_rx,
             stream_id_gen: StreamIdGenerator::new(is_client),
             frame_tx,
             die: Arc::new(Notify::new()),
@@ -133,7 +133,7 @@ where
         let stream_id = self.inner.stream_id_gen.next()?;
 
         // Create data channel for this stream
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let (data_tx, data_rx) = flume::unbounded();
 
         // Create stream state
         let stream_state = StreamState {
@@ -151,7 +151,7 @@ where
         let syn_frame = Frame::new_syn(self.inner.config.version, stream_id);
         self.inner
             .frame_tx
-            .send(syn_frame)
+            .send_async(syn_frame)
             .await
             .map_err(|_| SmuxError::SessionClosed)?;
 
@@ -164,10 +164,15 @@ where
             return Ok(None);
         }
 
-        let mut rx = self.inner.incoming_streams_rx.lock().await;
+        let rx = &self.inner.incoming_streams_rx;
 
         tokio::select! {
-            stream = rx.recv() => Ok(stream),
+            result = rx.recv_async() => {
+                match result {
+                    Ok(stream) => Ok(Some(stream)),
+                    Err(_) => Ok(None), // Channel is closed
+                }
+            },
             _ = self.inner.die.notified() => Ok(None),
         }
     }
@@ -232,7 +237,7 @@ where
 /// Background task that writes frames to the transport
 async fn send_loop<T>(
     mut sink: futures::stream::SplitSink<Framed<T, Codec>, Frame>,
-    mut frame_rx: mpsc::Receiver<Frame>,
+    frame_rx: flume::Receiver<Frame>,
     inner: Arc<SessionInner<T>>,
 ) -> Result<()>
 where
@@ -240,15 +245,15 @@ where
 {
     loop {
         tokio::select! {
-            frame = frame_rx.recv() => {
-                match frame {
-                    Some(frame) => {
+            result = frame_rx.recv_async() => {
+                match result {
+                    Ok(frame) => {
                         if let Err(e) = sink.send(frame).await {
                             tracing::error!("Frame send error: {}", e);
                             break;
                         }
                     }
-                    None => {
+                    Err(_) => {
                         tracing::info!("Frame sender closed");
                         break;
                     }
@@ -302,7 +307,7 @@ where
     }
 
     // Create data channel for this stream
-    let (data_tx, data_rx) = mpsc::unbounded_channel();
+    let (data_tx, data_rx) = flume::unbounded();
 
     // Create stream state
     let stream_state = StreamState {
@@ -317,7 +322,7 @@ where
     inner.streams.insert(stream_id, stream_state);
 
     // Send to accept channel
-    if (inner.incoming_streams_tx.send(stream).await).is_err() {
+    if (inner.incoming_streams_tx.send_async(stream).await).is_err() {
         // Accept channel is closed, remove from streams map
         inner.streams.remove(&stream_id);
         return Err(SmuxError::SessionClosed);
@@ -354,7 +359,7 @@ where
 
     // Find the stream and send data to it
     if let Some(stream_state) = inner.streams.get(&stream_id) {
-        if !frame.data.is_empty() && stream_state.data_tx.send(frame.data).is_err() {
+        if !frame.data.is_empty() && stream_state.data_tx.try_send(frame.data).is_err() {
             // Stream receiver is closed, remove from map
             drop(stream_state);
             inner.streams.remove(&stream_id);

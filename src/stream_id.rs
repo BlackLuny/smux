@@ -17,16 +17,16 @@ impl StreamIdGenerator {
     }
 
     pub fn next(&self) -> Result<u32> {
-        let next_id = self.next_id.fetch_add(2, Ordering::Relaxed);
+        let current = self.next_id.fetch_add(2, Ordering::Relaxed);
 
         // Check for overflow after the increment
-        if next_id > u32::MAX - 2 {
+        if current > u32::MAX - 2 {
             return Err(SmuxError::ProtocolViolation(
                 "Stream ID overflow - session should be restarted".to_string(),
             ));
         }
 
-        Ok(next_id)
+        Ok(current)
     }
 
     pub fn validate_peer_stream_id(&self, stream_id: u32) -> Result<()> {

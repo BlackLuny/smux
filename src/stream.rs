@@ -3,6 +3,7 @@ use crate::{
     frame::Frame,
 };
 use bytes::Bytes;
+use flume;
 use std::{
     pin::Pin,
     sync::{
@@ -11,10 +12,7 @@ use std::{
     },
     task::{Context, Poll},
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::mpsc,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A multiplexed stream within a smux session
 ///
@@ -24,9 +22,9 @@ pub struct Stream {
     /// Stream ID
     stream_id: u32,
     /// Sends frames to the session's send_loop
-    frame_tx: mpsc::Sender<Frame>,
+    frame_tx: flume::Sender<Frame>,
     /// Receives incoming data chunks from the session
-    data_rx: mpsc::UnboundedReceiver<Bytes>,
+    data_rx: flume::Receiver<Bytes>,
     /// A temporary buffer for when a user reads only part of a data chunk
     current_chunk: Option<Bytes>,
     /// Set when a FIN frame is received (no more data from peer)
@@ -38,8 +36,8 @@ pub struct Stream {
 impl Stream {
     pub(crate) fn new(
         stream_id: u32,
-        frame_tx: mpsc::Sender<Frame>,
-        data_rx: mpsc::UnboundedReceiver<Bytes>,
+        frame_tx: flume::Sender<Frame>,
+        data_rx: flume::Receiver<Bytes>,
     ) -> Self {
         Self {
             stream_id,
@@ -76,7 +74,7 @@ impl Stream {
         if !self.is_write_closed.swap(true, Ordering::Relaxed) {
             let fin_frame = Frame::new_fin(1, self.stream_id); // TODO: Use actual version
             self.frame_tx
-                .send(fin_frame)
+                .send_async(fin_frame)
                 .await
                 .map_err(|_| SmuxError::SessionClosed)?;
         }
@@ -109,8 +107,9 @@ impl AsyncRead for Stream {
         }
 
         // No current chunk or remaining buffer space, try to get a new chunk
-        match this.data_rx.poll_recv(cx) {
-            Poll::Ready(Some(mut chunk)) => {
+        // No current chunk or remaining buffer space, try to get a new chunk
+        match this.data_rx.try_recv() {
+            Ok(mut chunk) => {
                 let to_copy = std::cmp::min(chunk.len(), buf.remaining());
                 if to_copy > 0 {
                     let data = chunk.split_to(to_copy);
@@ -120,23 +119,22 @@ impl AsyncRead for Stream {
                     if !chunk.is_empty() {
                         this.current_chunk = Some(chunk);
                     }
-
-                    Poll::Ready(Ok(()))
                 } else {
                     // No buffer space, store the chunk for later
                     this.current_chunk = Some(chunk);
-                    Poll::Ready(Ok(()))
                 }
+                Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => {
+            Err(flume::TryRecvError::Disconnected) => {
                 // Channel closed, return EOF
                 Poll::Ready(Ok(()))
             }
-            Poll::Pending => {
+            Err(flume::TryRecvError::Empty) => {
                 // No data available, check if read is closed
                 if this.is_read_closed.load(Ordering::Relaxed) {
                     Poll::Ready(Ok(()))
                 } else {
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
             }
@@ -174,12 +172,12 @@ impl AsyncWrite for Stream {
         // Try to send the frame
         match this.frame_tx.try_send(psh_frame) {
             Ok(_) => Poll::Ready(Ok(chunk_size)),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(flume::TrySendError::Full(_)) => {
                 // Channel is full, return pending and will be woken when ready
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(flume::TrySendError::Disconnected(_)) => {
                 // Channel closed
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -208,12 +206,12 @@ impl AsyncWrite for Stream {
                 this.is_write_closed.store(true, Ordering::Relaxed);
                 Poll::Ready(Ok(()))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(flume::TrySendError::Full(_)) => {
                 // Channel is full, wake and try again
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(flume::TrySendError::Disconnected(_)) => {
                 // Channel closed, consider it shutdown
                 this.is_write_closed.store(true, Ordering::Relaxed);
                 Poll::Ready(Ok(()))
@@ -243,8 +241,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_creation() {
-        let (frame_tx, _) = mpsc::channel(1);
-        let (_, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, _) = flume::bounded(1);
+        let (_, data_rx) = flume::unbounded();
 
         let stream = Stream::new(123, frame_tx, data_rx);
         assert_eq!(stream.stream_id(), 123);
@@ -255,8 +253,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_read_with_data() {
-        let (frame_tx, _) = mpsc::channel(1);
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, _) = flume::bounded(1);
+        let (data_tx, data_rx) = flume::unbounded();
 
         let mut stream = Stream::new(123, frame_tx, data_rx);
 
@@ -273,8 +271,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_read_eof() {
-        let (frame_tx, _) = mpsc::channel(1);
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, _) = flume::bounded(1);
+        let (data_tx, data_rx) = flume::unbounded();
 
         let mut stream = Stream::new(123, frame_tx, data_rx);
 
@@ -289,8 +287,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_write() {
-        let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (_, data_rx) = flume::unbounded();
 
         let mut stream = Stream::new(123, frame_tx, data_rx);
 
@@ -300,7 +298,7 @@ mod tests {
         assert_eq!(n, test_data.len());
 
         // Verify PSH frame was sent
-        let frame = frame_rx.recv().await.unwrap();
+        let frame = frame_rx.recv_async().await.unwrap();
         assert_eq!(frame.cmd, Command::Psh);
         assert_eq!(frame.stream_id, 123);
         assert_eq!(frame.data.as_ref(), test_data);
@@ -308,8 +306,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_shutdown() {
-        let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (_, data_rx) = flume::unbounded();
 
         let mut stream = Stream::new(123, frame_tx, data_rx);
 
@@ -318,15 +316,15 @@ mod tests {
         assert!(stream.is_write_closed());
 
         // Verify FIN frame was sent
-        let frame = frame_rx.recv().await.unwrap();
+        let frame = frame_rx.recv_async().await.unwrap();
         assert_eq!(frame.cmd, Command::Fin);
         assert_eq!(frame.stream_id, 123);
     }
 
     #[tokio::test]
     async fn test_stream_close() {
-        let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (_, data_rx) = flume::unbounded();
 
         let mut stream = Stream::new(123, frame_tx, data_rx);
 
@@ -335,15 +333,15 @@ mod tests {
         assert!(stream.is_write_closed());
 
         // Verify FIN frame was sent
-        let frame = frame_rx.recv().await.unwrap();
+        let frame = frame_rx.recv_async().await.unwrap();
         assert_eq!(frame.cmd, Command::Fin);
         assert_eq!(frame.stream_id, 123);
     }
 
     #[tokio::test]
     async fn test_stream_multiple_reads() {
-        let (frame_tx, _) = mpsc::channel(1);
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, _) = flume::bounded(1);
+        let (data_tx, data_rx) = flume::unbounded();
 
         let mut stream = Stream::new(123, frame_tx, data_rx);
 
@@ -367,8 +365,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_drop_sends_fin() {
-        let (frame_tx, mut frame_rx) = mpsc::channel(1);
-        let (_, data_rx) = mpsc::unbounded_channel();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (_, data_rx) = flume::unbounded();
 
         {
             let _stream = Stream::new(123, frame_tx, data_rx);
