@@ -1,83 +1,203 @@
 # 007: Benchmarking Specification
 
-This document outlines the strategy for performance benchmarking the `smux` Rust library to ensure it meets high-performance standards and to track regressions over time.
+This document outlines the strategy for performance benchmarking the `smux` Rust library, focusing on throughput testing for data send/receive operations.
 
 ## 1. Tooling
 
-We will use the [`criterion`](https://crates.io/crates/criterion) crate as our primary benchmarking framework. It provides statistically rigorous analysis and is the de facto standard for benchmarking in the Rust ecosystem.
+We will use **Criterion.rs** for benchmarking, which works with stable Rust and provides statistical analysis, plotting, and detailed performance reports. This approach is more robust than unstable nightly benchmarks.
+
+Add to `Cargo.toml`:
+```toml
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "throughput"
+harness = false
+```
 
 ## 2. Benchmark Scenarios
 
-The benchmarks will be organized in the `benches` directory and will cover the following key scenarios:
+The benchmarks will measure data transfer rates for different stream configurations to evaluate multiplexing performance.
 
-### 2.1. Throughput
+### 2.1. Throughput Tests
 
-*   **Goal**: Measure the maximum data transfer rate.
-*   **Scenarios**:
-    1.  **Single-Stream Throughput**: Measure the speed of sending a large amount of data (e.g., 1 GB) over a single stream. This will test the raw performance of the data path.
-    2.  **Multi-Stream Throughput**: Measure the aggregate throughput when sending data over many concurrent streams (e.g., 100 streams sending 10 MB each). This will test the session's ability to handle concurrent load.
+**Goal**: Measure data send/receive speeds under various concurrent stream loads.
 
-### 2.2. Latency
+**Test Scenarios**:
+1. **Single Stream**: Baseline throughput with one stream
+2. **Multiple Streams**: Concurrent streams (2, 4, 8, 16, 32) to test multiplexing efficiency
+3. **Large Data Transfer**: Send large payloads (1MB, 10MB) to test sustained throughput
+4. **Small Message Burst**: Many small messages to test frame overhead impact
 
-*   **Goal**: Measure the overhead of stream creation and communication.
-*   **Scenarios**:
-    1.  **Stream Open Latency**: Measure the time it takes to open a new stream and receive a confirmation from the peer (round-trip time for `SYN`).
-    2.  **Ping-Pong Latency**: Measure the round-trip time of sending a small message on a stream and receiving a reply. This will test the latency of the entire data path for small payloads.
-
-### 2.3. Concurrency and Scalability
-
-*   **Goal**: Measure how the library performs as the number of streams increases.
-*   **Scenarios**:
-    1.  **Stream Creation Rate**: Measure how many new streams can be opened per second.
-    2.  **High-Concurrency Ping-Pong**: Run the ping-pong test across a large number of concurrent streams (e.g., 1,000 or 10,000) to identify any contention points in the session management logic.
+**Data Patterns**:
+- **Sequential Write/Read**: Continuous data streaming
+- **Ping-Pong**: Request-response pattern measuring round-trip efficiency
+- **Bidirectional**: Simultaneous send/receive on same stream
 
 ## 3. Methodology
 
-*   **Setup**: Benchmarks will be run locally, using a `tokio` TCP client/server pair communicating over the loopback interface. This minimizes network variability.
-*   **Implementation**: Each benchmark will be defined in its own file within the `benches` directory (e.g., `benches/throughput.rs`).
-*   **Execution**: Benchmarks will be run using `cargo bench`. The results will be stored, and `criterion` will automatically compare performance against previous runs, highlighting any regressions.
+**Setup**: 
+- Use `tokio` TCP client/server pair over loopback interface
+- Sessions established with default configuration
+- Benchmarks run for statistically significant duration (Criterion handles this)
 
-## 4. Example Benchmark Structure
+**Execution**: 
+- Run with `cargo bench`
+- Criterion generates HTML reports in `target/criterion/`
+- Results include throughput metrics (bytes/sec), latency percentiles, and regression analysis
 
-Here is a conceptual example of what a throughput benchmark might look like:
+**Environment**:
+- Benchmark on dedicated test data to ensure consistent measurements
+- Test with different chunk sizes (1KB, 8KB, 64KB) to find optimal transfer size
+
+## 4. Example Benchmark Implementation
 
 ```rust
-// benches/throughput_bench.rs
-use criterion::{criterion_group, criterion_main, Criterion, Throughput, Bencher};
+// benches/throughput.rs
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use smux::{Config, Session};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
-use smux::{Session, Config};
-// ... other necessary imports
 
-fn setup_session_pair() -> (Session, Session) {
-    // Helper to create a client and server session connected over an in-memory pipe
-    // ...
+const CHUNK_SIZE: usize = 8192; // 8KB chunks
+const TEST_DATA_SIZE: usize = 1024 * 1024; // 1MB total
+
+async fn setup_session_pair() -> (Session<TcpStream>, Session<TcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    
+    let client_stream = TcpStream::connect(addr).await.unwrap();
+    let (server_stream, _) = listener.accept().await.unwrap();
+    
+    let config = Config::default();
+    let client_session = Session::new_client(client_stream, config.clone()).await.unwrap();
+    let server_session = Session::new_server(server_stream, config).await.unwrap();
+    
+    (client_session, server_session)
 }
 
-fn single_stream_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("single_stream_throughput");
-    let data_size = 1024 * 1024; // 1 MB
-
-    group.throughput(Throughput::Bytes(data_size as u64));
-    group.bench_function("1mb_transfer", |b: &mut Bencher| {
-        let rt = Runtime::new().unwrap();
-        b.to_async(rt).iter_batched(
-            setup_session_pair,
-            |(mut client_session, mut server_session)| async move {
-                // ... benchmark logic ...
-            },
-            criterion::BatchSize::SmallInput,
-        );
+async fn throughput_test(num_streams: usize, data_size: usize) -> u64 {
+    let (client_session, server_session) = setup_session_pair().await;
+    let test_data = vec![0u8; CHUNK_SIZE];
+    
+    // Server task: accept streams and echo data
+    let server_handle = tokio::spawn(async move {
+        let mut total_bytes = 0u64;
+        for _ in 0..num_streams {
+            let mut stream = server_session.accept_stream().await.unwrap();
+            let test_data = test_data.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; CHUNK_SIZE];
+                let mut bytes_received = 0;
+                while bytes_received < data_size {
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    if n == 0 { break; }
+                    bytes_received += n;
+                    total_bytes += n as u64;
+                }
+            });
+        }
+        total_bytes
     });
+    
+    // Client task: open streams and send data
+    let mut client_handles = Vec::new();
+    for _ in 0..num_streams {
+        let mut stream = client_session.open_stream().await.unwrap();
+        let test_data = test_data.clone();
+        let handle = tokio::spawn(async move {
+            let mut bytes_sent = 0;
+            while bytes_sent < data_size {
+                let chunk_size = std::cmp::min(CHUNK_SIZE, data_size - bytes_sent);
+                stream.write_all(&test_data[..chunk_size]).await.unwrap();
+                bytes_sent += chunk_size;
+            }
+            stream.flush().await.unwrap();
+        });
+        client_handles.push(handle);
+    }
+    
+    // Wait for completion
+    for handle in client_handles {
+        handle.await.unwrap();
+    }
+    
+    server_handle.await.unwrap()
+}
+
+fn bench_single_stream_throughput(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("single_stream");
+    group.throughput(Throughput::Bytes(TEST_DATA_SIZE as u64));
+    
+    group.bench_function("1MB", |b| {
+        b.to_async(&rt).iter(|| async {
+            black_box(throughput_test(1, TEST_DATA_SIZE).await)
+        })
+    });
+    
     group.finish();
 }
 
-criterion_group!(benches, single_stream_throughput);
+fn bench_multiple_streams_throughput(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("multiple_streams");
+    
+    for num_streams in [2, 4, 8, 16].iter() {
+        group.throughput(Throughput::Bytes((TEST_DATA_SIZE * num_streams) as u64));
+        group.bench_with_input(
+            format!("{}_streams", num_streams),
+            num_streams,
+            |b, &num_streams| {
+                b.to_async(&rt).iter(|| async {
+                    black_box(throughput_test(num_streams, TEST_DATA_SIZE).await)
+                })
+            },
+        );
+    }
+    
+    group.finish();
+}
+
+criterion_group!(benches, bench_single_stream_throughput, bench_multiple_streams_throughput);
 criterion_main!(benches);
 ```
 
-## 5. Performance Goals
+## 5. Performance Goals & Usage
 
-*   **Primary Goal**: To be competitive with, or exceed, the performance of the original Go implementation under similar conditions.
-*   **Secondary Goal**: To ensure that no code changes introduce significant performance regressions without justification. `criterion`'s regression analysis will be key to enforcing this.
+**Primary Goals**:
+- Achieve competitive throughput with Go smux implementation
+- Identify optimal chunk sizes and stream concurrency levels
+- Detect performance regressions in future changes
+- Establish baseline metrics for multiplexing efficiency
 
-By implementing this benchmarking strategy, we can be confident in the library's performance and make data-driven decisions during development and optimization.
+**Running Benchmarks**:
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run specific benchmark group
+cargo bench single_stream
+
+# Generate HTML reports (saved to target/criterion/)
+cargo bench -- --output-format html
+
+# Run with specific test duration
+cargo bench -- --measurement-time 10
+```
+
+**Interpreting Results**:
+- **Throughput**: Bytes/second for data transfer rate
+- **Latency**: Time per operation (lower is better)  
+- **Regression Analysis**: Criterion detects performance changes over time
+- **Statistical Significance**: Confidence intervals and variance analysis
+
+**Expected Performance Targets**:
+- Single stream: >100 MB/s on loopback
+- Multiple streams: Linear scaling up to CPU/network limits
+- Low latency: <1ms for small message round-trips
+- Memory efficiency: Minimal allocation overhead per stream
