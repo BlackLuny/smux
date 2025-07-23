@@ -31,6 +31,8 @@ pub struct Stream {
     is_read_closed: Arc<AtomicBool>,
     /// Set when the stream is closed for writing
     is_write_closed: Arc<AtomicBool>,
+    /// Reference to session's closed state for immediate termination
+    session_closed: Arc<AtomicBool>,
 }
 
 impl Stream {
@@ -38,6 +40,7 @@ impl Stream {
         stream_id: u32,
         frame_tx: flume::Sender<Frame>,
         data_rx: flume::Receiver<Bytes>,
+        session_closed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             stream_id,
@@ -46,6 +49,7 @@ impl Stream {
             current_chunk: None,
             is_read_closed: Arc::new(AtomicBool::new(false)),
             is_write_closed: Arc::new(AtomicBool::new(false)),
+            session_closed,
         }
     }
 
@@ -89,6 +93,11 @@ impl AsyncRead for Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+
+        // Check if session is closed - if so, return EOF immediately
+        if this.session_closed.load(Ordering::Relaxed) {
+            return Poll::Ready(Ok(())); // EOF
+        }
 
         // First, try to fulfill the read from any partially consumed chunk
         if let Some(ref mut chunk) = this.current_chunk {
@@ -149,6 +158,14 @@ impl AsyncWrite for Stream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+
+        // Check if session is closed - if so, return BrokenPipe error
+        if this.session_closed.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Session is closed",
+            )));
+        }
 
         if this.is_write_closed.load(Ordering::Relaxed) {
             return Poll::Ready(Err(std::io::Error::new(
@@ -243,8 +260,9 @@ mod tests {
     async fn test_stream_creation() {
         let (frame_tx, _) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
-        let stream = Stream::new(123, frame_tx, data_rx);
+        let stream = Stream::new(123, frame_tx, data_rx, session_closed);
         assert_eq!(stream.stream_id(), 123);
         assert!(!stream.is_read_closed());
         assert!(!stream.is_write_closed());
@@ -255,8 +273,9 @@ mod tests {
     async fn test_stream_read_with_data() {
         let (frame_tx, _) = flume::bounded(1);
         let (data_tx, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = Stream::new(123, frame_tx, data_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
 
         // Send data directly to the data channel
         let test_data = Bytes::from("hello world");
@@ -273,8 +292,9 @@ mod tests {
     async fn test_stream_read_eof() {
         let (frame_tx, _) = flume::bounded(1);
         let (data_tx, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = Stream::new(123, frame_tx, data_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
 
         // Close the data channel to simulate EOF
         drop(data_tx);
@@ -289,8 +309,9 @@ mod tests {
     async fn test_stream_write() {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = Stream::new(123, frame_tx, data_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
 
         // Write some data
         let test_data = b"hello world";
@@ -308,8 +329,9 @@ mod tests {
     async fn test_stream_shutdown() {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = Stream::new(123, frame_tx, data_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
 
         // Shutdown the stream
         stream.shutdown().await.unwrap();
@@ -325,8 +347,9 @@ mod tests {
     async fn test_stream_close() {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = Stream::new(123, frame_tx, data_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
 
         // Close the stream
         stream.close().await.unwrap();
@@ -342,8 +365,9 @@ mod tests {
     async fn test_stream_multiple_reads() {
         let (frame_tx, _) = flume::bounded(1);
         let (data_tx, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = Stream::new(123, frame_tx, data_rx);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
 
         // Send multiple data chunks
         let data1 = Bytes::from("hello ");
@@ -367,9 +391,10 @@ mod tests {
     async fn test_stream_drop_sends_fin() {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
 
         {
-            let _stream = Stream::new(123, frame_tx, data_rx);
+            let _stream = Stream::new(123, frame_tx, data_rx, session_closed);
             // Stream is dropped here
         }
 
@@ -435,5 +460,43 @@ mod tests {
         // Close streams
         client_stream.shutdown().await.unwrap();
         server_stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stream_immediate_close_on_session_closed() {
+        let (frame_tx, _frame_rx) = flume::bounded(1);
+        let (data_tx, data_rx) = flume::unbounded();
+        let session_closed = Arc::new(AtomicBool::new(false));
+
+        let mut stream = Stream::new(123, frame_tx, data_rx, Arc::clone(&session_closed));
+
+        // Initially, read and write should work normally
+        assert!(!session_closed.load(Ordering::Relaxed));
+
+        // Send some test data for reading
+        data_tx.send(Bytes::from("test data")).unwrap();
+        let mut read_buf = [0u8; 10];
+        let n = stream.read(&mut read_buf).await.unwrap();
+        assert_eq!(n, 9); // "test data" length
+        assert_eq!(&read_buf[..n], b"test data");
+
+        // Write should work
+        let write_result = stream.write(b"hello").await;
+        assert!(write_result.is_ok());
+
+        // Now simulate session closure
+        session_closed.store(true, Ordering::Relaxed);
+
+        // Read should immediately return EOF (0 bytes)
+        let mut read_buf2 = [0u8; 10];
+        let n = stream.read(&mut read_buf2).await.unwrap();
+        assert_eq!(n, 0); // EOF
+
+        // Write should immediately return BrokenPipe error
+        let write_result = stream.write(b"should fail").await;
+        assert!(write_result.is_err());
+        let err = write_result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(err.to_string().contains("Session is closed"));
     }
 }

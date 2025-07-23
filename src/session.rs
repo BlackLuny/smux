@@ -54,7 +54,7 @@ struct SessionInner<T> {
     /// Session shutdown signal
     die: Arc<Notify>,
     /// Flag to track if session is closed
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     /// Transport type marker
     _transport: std::marker::PhantomData<T>,
 }
@@ -105,7 +105,7 @@ where
             is_client,
             frame_tx,
             die: Arc::new(Notify::new()),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             _transport: std::marker::PhantomData,
         });
 
@@ -150,7 +150,12 @@ where
         };
 
         // Create stream
-        let stream = Stream::new(stream_id, self.inner.frame_tx.clone(), data_rx);
+        let stream = Stream::new(
+            stream_id,
+            self.inner.frame_tx.clone(),
+            data_rx,
+            Arc::clone(&self.inner.closed),
+        );
 
         // Add to streams map
         self.inner.streams.insert(stream_id, stream_state);
@@ -353,7 +358,12 @@ where
     };
 
     // Create stream
-    let stream = Stream::new(stream_id, inner.frame_tx.clone(), data_rx);
+    let stream = Stream::new(
+        stream_id,
+        inner.frame_tx.clone(),
+        data_rx,
+        Arc::clone(&inner.closed),
+    );
 
     // Add to streams map
     inner.streams.insert(stream_id, stream_state);
@@ -517,7 +527,7 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             die: Arc::new(Notify::new()),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             _transport: std::marker::PhantomData,
         };
 
@@ -537,7 +547,7 @@ mod tests {
             is_client: false,
             frame_tx: flume::bounded(1).0,
             die: Arc::new(Notify::new()),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             _transport: std::marker::PhantomData,
         };
 
@@ -557,7 +567,7 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             die: Arc::new(Notify::new()),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             _transport: std::marker::PhantomData,
         };
         assert!(inner.next_stream_id().is_err());
@@ -574,7 +584,7 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             die: Arc::new(Notify::new()),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             _transport: std::marker::PhantomData,
         };
         let server_inner = SessionInner::<tokio::io::DuplexStream> {
@@ -586,7 +596,7 @@ mod tests {
             is_client: false,
             frame_tx: flume::bounded(1).0,
             die: Arc::new(Notify::new()),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             _transport: std::marker::PhantomData,
         };
 
