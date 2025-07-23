@@ -175,8 +175,8 @@ test_with_timeout!(test_e2e_large_data_transfer, 30, {
     let port = find_available_port().await?;
     let addr = format!("127.0.0.1:{port}");
 
-    // Create large test data (32KB to avoid overwhelming the test)
-    let test_data: Vec<u8> = (0..32768).map(|i| (i % 256) as u8).collect();
+    // Create large test data (10MB to avoid overwhelming the test)
+    let test_data: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
     let test_data_clone = test_data.clone();
 
     // Start server in background task
@@ -196,17 +196,27 @@ test_with_timeout!(test_e2e_large_data_transfer, 30, {
             let mut received_data = Vec::new();
             let mut buffer = [0u8; 4096];
             loop {
-                let n = server_stream.read(&mut buffer).await.unwrap();
-                if n == 0 {
-                    break; // EOF
-                }
-                received_data.extend_from_slice(&buffer[..n]);
-
-                // Prevent infinite loop in case of issues
-                if received_data.len() >= test_data_clone.len() {
-                    break;
+                match server_stream.read(&mut buffer).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        received_data.extend_from_slice(&buffer[..n]);
+                        // Prevent infinite loop in case of issues
+                        if received_data.len() >= test_data_clone.len() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Server read error: {e}");
+                        break;
+                    }
                 }
             }
+
+            println!(
+                "Server received {} bytes, expected {}",
+                received_data.len(),
+                test_data_clone.len()
+            );
 
             // Verify we received all data correctly
             assert_eq!(received_data.len(), test_data_clone.len());
@@ -228,13 +238,22 @@ test_with_timeout!(test_e2e_large_data_transfer, 30, {
 
     // Open stream and send large data
     let mut client_stream = client_session.open_stream().await?;
-    client_stream.write_all(&test_data).await?;
-    client_stream.shutdown().await?;
 
-    // Read acknowledgment
+    // Send data in chunks to help with flow control
+    let chunk_size = 4096;
+    for chunk in test_data.chunks(chunk_size) {
+        client_stream.write_all(chunk).await?;
+    }
+
+    println!("Client sent {} bytes", test_data.len());
+
+    // Read acknowledgment first, before shutting down
     let mut ack_buffer = [0u8; 12];
     client_stream.read_exact(&mut ack_buffer).await?;
     assert_eq!(&ack_buffer, b"received_all");
+
+    // Now shutdown the client stream
+    client_stream.shutdown().await?;
 
     // Wait for server to complete
     server_handle.await.unwrap();

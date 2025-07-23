@@ -155,6 +155,7 @@ where
             self.inner.frame_tx.clone(),
             data_rx,
             Arc::clone(&self.inner.closed),
+            Arc::clone(&self.inner.config),
         );
 
         // Add to streams map
@@ -363,6 +364,7 @@ where
         inner.frame_tx.clone(),
         data_rx,
         Arc::clone(&inner.closed),
+        Arc::clone(&inner.config),
     );
 
     // Add to streams map

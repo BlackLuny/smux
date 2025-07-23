@@ -1,4 +1,5 @@
 use crate::{
+    config::Config,
     error::{Result, SmuxError},
     frame::Frame,
 };
@@ -33,6 +34,8 @@ pub struct Stream {
     is_write_closed: Arc<AtomicBool>,
     /// Reference to session's closed state for immediate termination
     session_closed: Arc<AtomicBool>,
+    /// Reference to session config for max_frame_size
+    config: Arc<Config>,
 }
 
 impl Stream {
@@ -41,6 +44,7 @@ impl Stream {
         frame_tx: flume::Sender<Frame>,
         data_rx: flume::Receiver<Bytes>,
         session_closed: Arc<AtomicBool>,
+        config: Arc<Config>,
     ) -> Self {
         Self {
             stream_id,
@@ -50,6 +54,7 @@ impl Stream {
             is_read_closed: Arc::new(AtomicBool::new(false)),
             is_write_closed: Arc::new(AtomicBool::new(false)),
             session_closed,
+            config,
         }
     }
 
@@ -180,7 +185,7 @@ impl AsyncWrite for Stream {
 
         // For now, we'll use a simple approach and send all data in one frame
         // TODO: Implement proper fragmentation and flow control
-        let max_frame_size = 4096; // TODO: Get from config
+        let max_frame_size = this.config.max_frame_size;
         let chunk_size = std::cmp::min(buf.len(), max_frame_size);
         let data = Bytes::copy_from_slice(&buf[..chunk_size]);
 
@@ -261,8 +266,9 @@ mod tests {
         let (frame_tx, _) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
-        let stream = Stream::new(123, frame_tx, data_rx, session_closed);
+        let stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
         assert_eq!(stream.stream_id(), 123);
         assert!(!stream.is_read_closed());
         assert!(!stream.is_write_closed());
@@ -274,8 +280,9 @@ mod tests {
         let (frame_tx, _) = flume::bounded(1);
         let (data_tx, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
 
         // Send data directly to the data channel
         let test_data = Bytes::from("hello world");
@@ -293,8 +300,9 @@ mod tests {
         let (frame_tx, _) = flume::bounded(1);
         let (data_tx, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
 
         // Close the data channel to simulate EOF
         drop(data_tx);
@@ -310,8 +318,9 @@ mod tests {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
 
         // Write some data
         let test_data = b"hello world";
@@ -330,8 +339,9 @@ mod tests {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
 
         // Shutdown the stream
         stream.shutdown().await.unwrap();
@@ -348,8 +358,9 @@ mod tests {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
 
         // Close the stream
         stream.close().await.unwrap();
@@ -366,8 +377,9 @@ mod tests {
         let (frame_tx, _) = flume::bounded(1);
         let (data_tx, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
 
         // Send multiple data chunks
         let data1 = Bytes::from("hello ");
@@ -392,9 +404,10 @@ mod tests {
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (_, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(crate::Config::default());
 
         {
-            let _stream = Stream::new(123, frame_tx, data_rx, session_closed);
+            let _stream = Stream::new(123, frame_tx, data_rx, session_closed, config);
             // Stream is dropped here
         }
 
@@ -468,7 +481,13 @@ mod tests {
         let (data_tx, data_rx) = flume::unbounded();
         let session_closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, Arc::clone(&session_closed));
+        let mut stream = Stream::new(
+            123,
+            frame_tx,
+            data_rx,
+            Arc::clone(&session_closed),
+            Arc::new(crate::Config::default()),
+        );
 
         // Initially, read and write should work normally
         assert!(!session_closed.load(Ordering::Relaxed));
