@@ -186,7 +186,9 @@ impl AsyncWrite for Stream {
         // For now, we'll use a simple approach and send all data in one frame
         // TODO: Implement proper fragmentation and flow control
         let max_frame_size = this.config.max_frame_size;
-        let chunk_size = std::cmp::min(buf.len(), max_frame_size);
+        // Account for frame header size when calculating max payload size
+        let max_payload_size = max_frame_size.saturating_sub(crate::frame::HEADER_SIZE);
+        let chunk_size = std::cmp::min(buf.len(), max_payload_size);
         let data = Bytes::copy_from_slice(&buf[..chunk_size]);
 
         let psh_frame = Frame::new_psh(1, this.stream_id, data); // TODO: Use actual version
