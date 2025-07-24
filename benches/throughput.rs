@@ -3,7 +3,6 @@ use smux::{Config, Session};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::runtime::Runtime;
 
 // Match Go benchmark: 128KB chunks
 const GO_CHUNK_SIZE: usize = 128 * 1024; // 128KB to match Go benchmark
@@ -44,7 +43,11 @@ async fn create_tcp_connection_pair() -> (TcpStream, TcpStream) {
 
 // Go-style benchmark: BenchmarkConnSmux equivalent
 fn bench_conn_smux(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    //let rt = Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("go_style_smux");
     let n = 10000;
 
@@ -112,7 +115,11 @@ fn bench_conn_smux(c: &mut Criterion) {
 
 // Go-style benchmark: BenchmarkConnTCP equivalent
 fn bench_conn_tcp(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    //let rt = Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("go_style_tcp");
     let n = 10000;
 
