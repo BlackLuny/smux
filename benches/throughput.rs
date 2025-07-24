@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 // Match Go benchmark: 128KB chunks
-const GO_CHUNK_SIZE: usize = 128 * 1024; // 128KB to match Go benchmark
+const CHUNK_SIZE: usize = 128 * 1024; // 128KB to match Go benchmark
 
 async fn create_tcp_session_pair() -> (Arc<Session<TcpStream>>, Arc<Session<TcpStream>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -41,28 +41,92 @@ async fn create_tcp_connection_pair() -> (TcpStream, TcpStream) {
     (client_stream, server_stream)
 }
 
-// Go-style benchmark: BenchmarkConnSmux equivalent
+async fn run_benchmark_routine<R, W>(
+    mut reader: R,
+    mut writer: W,
+    write_buf: Vec<u8>,
+    read_buf: Vec<u8>,
+    n: usize,
+) -> u64
+where
+    R: AsyncReadExt + Send + Unpin + 'static,
+    W: AsyncWriteExt + Send + Unpin + 'static,
+{
+    let reader_handle = tokio::spawn(async move {
+        let mut read_buf = read_buf;
+        let mut total_read = 0;
+        while total_read < CHUNK_SIZE * n {
+            match reader.read(&mut read_buf).await {
+                Ok(0) => break,
+                Ok(bytes_read) => total_read += bytes_read,
+                Err(_) => break,
+            }
+        }
+        total_read as u64
+    });
+
+    let writer_handle = tokio::spawn(async move {
+        for _i in 0..n {
+            writer.write_all(&write_buf).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+        CHUNK_SIZE as u64 * n as u64
+    });
+
+    let (received, _sent) = tokio::join!(reader_handle, writer_handle);
+    received.unwrap()
+}
+
+async fn run_smux_benchmark(
+    mut server_stream: smux::Stream,
+    mut client_stream: smux::Stream,
+    write_buf: Vec<u8>,
+    read_buf: Vec<u8>,
+    n: usize,
+) -> u64 {
+    let reader_handle = tokio::spawn(async move {
+        let mut read_buf = read_buf;
+        let mut total_read = 0;
+        while total_read < CHUNK_SIZE * n {
+            match server_stream.read(&mut read_buf).await {
+                Ok(0) => break,
+                Ok(bytes_read) => total_read += bytes_read,
+                Err(_) => break,
+            }
+        }
+        total_read as u64
+    });
+
+    let writer_handle = tokio::spawn(async move {
+        for _i in 0..n {
+            client_stream.write_all(&write_buf).await.unwrap();
+        }
+        client_stream.flush().await.unwrap();
+        client_stream.close().await.unwrap();
+        CHUNK_SIZE as u64 * n as u64
+    });
+
+    let (received, _sent) = tokio::join!(reader_handle, writer_handle);
+    received.unwrap()
+}
+
 fn bench_conn_smux(c: &mut Criterion) {
-    //let rt = Runtime::new().unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let mut group = c.benchmark_group("go_style_smux");
+    let mut group = c.benchmark_group("smux");
     let n = 10000;
 
-    // Match Go benchmark settings
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(10));
-    group.throughput(Throughput::Bytes((GO_CHUNK_SIZE as u64) * n as u64));
+    group.throughput(Throughput::Bytes((CHUNK_SIZE as u64) * n as u64));
 
-    // Create persistent TCP sessions once for all iterations
     let (client_session, server_session) = rt.block_on(create_tcp_session_pair());
 
     group.bench_function("BenchmarkConnSmux", |b| {
         b.iter_batched(
             || {
-                // Setup: create new streams for each iteration
                 rt.block_on(async {
                     let client_stream = client_session.clone().open_stream().await.unwrap();
                     let server_stream = server_session
@@ -71,39 +135,17 @@ fn bench_conn_smux(c: &mut Criterion) {
                         .await
                         .unwrap()
                         .unwrap();
-                    (client_stream, server_stream)
+                    let write_buf = vec![42u8; CHUNK_SIZE];
+                    let read_buf = vec![0u8; CHUNK_SIZE];
+                    (client_stream, server_stream, write_buf, read_buf)
                 })
             },
-            |(mut client_stream, mut server_stream)| {
-                // Benchmark: use the pre-created streams
+            |(client_stream, server_stream, write_buf, read_buf)| {
                 rt.block_on(async {
-                    let write_buf = vec![42u8; GO_CHUNK_SIZE];
-                    let mut read_buf = vec![0u8; GO_CHUNK_SIZE];
-
-                    let reader_handle = tokio::spawn(async move {
-                        let mut total_read = 0;
-                        while total_read < GO_CHUNK_SIZE * n {
-                            match server_stream.read(&mut read_buf).await {
-                                Ok(0) => break, // EOF
-                                Ok(n) => total_read += n,
-                                Err(_) => break,
-                            }
-                        }
-                        total_read as u64
-                    });
-
-                    let writer_handle = tokio::spawn(async move {
-                        for _i in 0..n {
-                            client_stream.write_all(&write_buf).await.unwrap();
-                            let _invalidate_buf = vec![43u8; GO_CHUNK_SIZE];
-                        }
-                        client_stream.flush().await.unwrap();
-                        client_stream.close().await.unwrap();
-                        GO_CHUNK_SIZE as u64 * n as u64
-                    });
-
-                    let (received, _sent) = tokio::join!(reader_handle, writer_handle);
-                    black_box(received.unwrap())
+                    let result =
+                        run_smux_benchmark(server_stream, client_stream, write_buf, read_buf, n)
+                            .await;
+                    black_box(result)
                 })
             },
             criterion::BatchSize::SmallInput,
@@ -113,56 +155,32 @@ fn bench_conn_smux(c: &mut Criterion) {
     group.finish();
 }
 
-// Go-style benchmark: BenchmarkConnTCP equivalent
 fn bench_conn_tcp(c: &mut Criterion) {
-    //let rt = Runtime::new().unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let mut group = c.benchmark_group("go_style_tcp");
+    let mut group = c.benchmark_group("raw_tcp");
     let n = 10000;
 
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(10));
-    group.throughput(Throughput::Bytes((GO_CHUNK_SIZE as u64) * n as u64));
+    group.throughput(Throughput::Bytes((CHUNK_SIZE as u64) * n as u64));
 
     group.bench_function("BenchmarkConnTCP", |b| {
         b.iter_batched(
             || {
-                // Setup: create new TCP connection for each iteration
-                rt.block_on(create_tcp_connection_pair())
+                let (stream1, stream2) = rt.block_on(create_tcp_connection_pair());
+                let write_buf = vec![42u8; CHUNK_SIZE];
+                let read_buf = vec![0u8; CHUNK_SIZE];
+                (stream1, stream2, write_buf, read_buf)
             },
-            |(mut client_stream, mut server_stream)| {
-                // Benchmark: use the pre-created TCP connection
+            |(client_stream, server_stream, write_buf, read_buf)| {
                 rt.block_on(async {
-                    let write_buf = vec![42u8; GO_CHUNK_SIZE];
-                    let mut read_buf = vec![0u8; GO_CHUNK_SIZE];
-
-                    let reader_handle = tokio::spawn(async move {
-                        let mut total_read = 0;
-                        while total_read < GO_CHUNK_SIZE * n {
-                            match server_stream.read(&mut read_buf).await {
-                                Ok(0) => break, // EOF
-                                Ok(n) => total_read += n,
-                                Err(_) => break,
-                            }
-                        }
-                        total_read as u64
-                    });
-
-                    let writer_handle = tokio::spawn(async move {
-                        for _i in 0..n {
-                            client_stream.write_all(&write_buf).await.unwrap();
-                            let _invalidate_buf = vec![43u8; GO_CHUNK_SIZE];
-                        }
-                        client_stream.flush().await.unwrap();
-                        drop(client_stream);
-                        GO_CHUNK_SIZE as u64 * n as u64
-                    });
-
-                    let (received, _sent) = tokio::join!(reader_handle, writer_handle);
-                    black_box(received.unwrap())
+                    let result =
+                        run_benchmark_routine(server_stream, client_stream, write_buf, read_buf, n)
+                            .await;
+                    black_box(result)
                 })
             },
             criterion::BatchSize::SmallInput,
