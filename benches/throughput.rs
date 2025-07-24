@@ -7,9 +7,6 @@ use tokio::runtime::Runtime;
 
 // Match Go benchmark: 128KB chunks
 const GO_CHUNK_SIZE: usize = 128 * 1024; // 128KB to match Go benchmark
-const CHUNK_SIZE: usize = 64 * 1024; // Our original 64KB for other tests
-
-const QUICK_SMALL: usize = 1024 * 1024; // 1MB
 
 async fn create_tcp_session_pair() -> (Arc<Session<TcpStream>>, Arc<Session<TcpStream>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -90,9 +87,6 @@ fn bench_conn_smux(c: &mut Criterion) {
                             }
                         }
                         total_read as u64
-                        // for _i in 0..n {
-                        //     server_stream.read_exact(&mut read_buf).await.unwrap();
-                        // }
                     });
 
                     let writer_handle = tokio::spawn(async move {
@@ -171,82 +165,5 @@ fn bench_conn_tcp(c: &mut Criterion) {
     group.finish();
 }
 
-// Quick test for development
-fn bench_quick_test(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let mut group = c.benchmark_group("quick_test");
-
-    group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(2));
-    group.warm_up_time(std::time::Duration::from_millis(500));
-    group.throughput(Throughput::Bytes(QUICK_SMALL as u64));
-
-    // Create persistent TCP sessions once for all iterations
-    let (client_session, server_session) = rt.block_on(create_tcp_session_pair());
-
-    group.bench_function("1MB_simple", |b| {
-        b.iter_batched(
-            || {
-                // Setup: create new streams for each iteration
-                rt.block_on(async {
-                    let client_stream = client_session.open_stream().await.unwrap();
-                    let server_stream = server_session.accept_stream().await.unwrap().unwrap();
-                    (client_stream, server_stream)
-                })
-            },
-            |(client_stream, server_stream)| {
-                // Benchmark: use the pre-created streams
-                rt.block_on(async {
-                    let test_data = vec![42u8; CHUNK_SIZE];
-
-                    let send_handle = {
-                        let mut client_stream = client_stream;
-                        let test_data = test_data.clone();
-                        tokio::spawn(async move {
-                            let mut bytes_sent = 0;
-                            while bytes_sent < QUICK_SMALL {
-                                let chunk_size =
-                                    std::cmp::min(CHUNK_SIZE, QUICK_SMALL - bytes_sent);
-                                if client_stream
-                                    .write_all(&test_data[..chunk_size])
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                bytes_sent += chunk_size;
-                            }
-                            drop(client_stream);
-                            bytes_sent
-                        })
-                    };
-
-                    let recv_handle = {
-                        let mut server_stream = server_stream;
-                        tokio::spawn(async move {
-                            let mut buffer = vec![0u8; CHUNK_SIZE];
-                            let mut bytes_received = 0u64;
-                            loop {
-                                match server_stream.read(&mut buffer).await {
-                                    Ok(0) => break,
-                                    Ok(n) => bytes_received += n as u64,
-                                    Err(_) => break,
-                                }
-                            }
-                            bytes_received
-                        })
-                    };
-
-                    let (_, received) = tokio::join!(send_handle, recv_handle);
-                    black_box(received.unwrap_or(0))
-                })
-            },
-            criterion::BatchSize::SmallInput,
-        )
-    });
-
-    group.finish();
-}
-
-criterion_group!(benches, bench_conn_smux, bench_conn_tcp, bench_quick_test);
+criterion_group!(benches, bench_conn_smux, bench_conn_tcp);
 criterion_main!(benches);
