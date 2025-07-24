@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -26,6 +26,14 @@ struct StreamState {
     data_tx: flume::Sender<Bytes>,
     /// Atomic flag for read closed state
     is_read_closed: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionState {
+    die: Arc<Notify>,
+    closed: Arc<AtomicBool>,
+    /// Tokens available for flow control
+    tokens: Arc<AtomicI64>,
 }
 
 /// A multiplexed session that manages multiple streams over a single connection
@@ -51,12 +59,54 @@ struct SessionInner<T> {
     is_client: bool,
     /// Sender for outgoing frames (to send_loop)
     frame_tx: flume::Sender<Frame>,
-    /// Session shutdown signal
-    die: Arc<Notify>,
-    /// Flag to track if session is closed
-    closed: Arc<AtomicBool>,
+    /// Session state passed to Streams
+    state: SessionState,
     /// Transport type marker
     _transport: std::marker::PhantomData<T>,
+}
+
+impl SessionState {
+    /// Create a new session state
+    pub fn new(buffer_size: usize) -> Self {
+        Self {
+            die: Arc::new(Notify::new()),
+            closed: Arc::new(AtomicBool::new(false)),
+            tokens: Arc::new(AtomicI64::new(buffer_size as i64)),
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn close_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.die)
+    }
+
+    pub fn close(&self) {
+        if self
+            .closed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.die.notify_waiters();
+        }
+    }
+}
+
+impl Clone for SessionState {
+    fn clone(&self) -> Self {
+        Self {
+            die: Arc::clone(&self.die),
+            closed: Arc::clone(&self.closed),
+            tokens: Arc::clone(&self.tokens),
+        }
+    }
 }
 
 impl<T> Clone for Session<T> {
@@ -104,8 +154,7 @@ where
             next_stream_id: AtomicU32::new(initial_id),
             is_client,
             frame_tx,
-            die: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: SessionState::new(config.max_receive_buffer),
             _transport: std::marker::PhantomData,
         });
 
@@ -133,7 +182,7 @@ where
 
     /// Open a new outgoing stream
     pub async fn open_stream(&self) -> Result<Stream> {
-        if self.inner.closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.is_closed() {
             return Err(SmuxError::SessionClosed);
         }
 
@@ -154,7 +203,7 @@ where
             stream_id,
             self.inner.frame_tx.clone(),
             data_rx,
-            Arc::clone(&self.inner.closed),
+            self.inner.state.clone(),
             Arc::clone(&self.inner.config),
         );
 
@@ -174,11 +223,12 @@ where
 
     /// Accept an incoming stream initiated by the peer
     pub async fn accept_stream(&self) -> Result<Stream> {
-        if self.inner.closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.is_closed() {
             return Err(SmuxError::SessionClosed);
         }
 
         let rx = &self.inner.incoming_streams_rx;
+        let close_notifier = self.inner.state.close_notifier();
 
         tokio::select! {
             result = rx.recv_async() => {
@@ -187,22 +237,21 @@ where
                     Err(_) => Err(SmuxError::SessionClosed),
                 }
             },
-            _ = self.inner.die.notified() => Err(SmuxError::SessionClosed),
+            _ = close_notifier.notified() => Err(SmuxError::SessionClosed),
         }
     }
 
     /// Close the session gracefully
+    #[inline]
     pub async fn close(&self) -> Result<()> {
-        self.inner
-            .closed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.inner.die.notify_waiters();
+        self.inner.state.close();
         Ok(())
     }
 
     /// Check if the session is closed
+    #[inline]
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(std::sync::atomic::Ordering::Relaxed)
+        self.inner.state.is_closed()
     }
 }
 
@@ -243,6 +292,7 @@ async fn recv_loop<T>(
 where
     T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
+    let close_notifier = inner.state.close_notifier();
     loop {
         tokio::select! {
             frame_result = stream.next() => {
@@ -262,7 +312,7 @@ where
                     }
                 }
             }
-            _ = inner.die.notified() => {
+            _ = close_notifier.notified() => {
                 tracing::info!("recv_loop shutting down");
                 break;
             }
@@ -270,10 +320,7 @@ where
     }
 
     // Signal session closed
-    inner
-        .closed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    inner.die.notify_waiters();
+    inner.state.close();
     Ok(())
 }
 
@@ -286,6 +333,7 @@ async fn send_loop<T>(
 where
     T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
+    let close_notifier = inner.state.close_notifier();
     loop {
         tokio::select! {
             result = frame_rx.recv_async() => {
@@ -302,7 +350,7 @@ where
                     }
                 }
             }
-            _ = inner.die.notified() => {
+            _ = close_notifier.notified() => {
                 tracing::info!("send_loop shutting down");
                 break;
             }
@@ -310,10 +358,7 @@ where
     }
 
     // Signal session closed
-    inner
-        .closed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    inner.die.notify_waiters();
+    inner.state.close();
     Ok(())
 }
 
@@ -363,7 +408,7 @@ where
         stream_id,
         inner.frame_tx.clone(),
         data_rx,
-        Arc::clone(&inner.closed),
+        inner.state.clone(),
         Arc::clone(&inner.config),
     );
 
@@ -528,8 +573,7 @@ mod tests {
             next_stream_id: AtomicU32::new(1),
             is_client: true,
             frame_tx: flume::bounded(1).0,
-            die: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: SessionState::new(1024),
             _transport: std::marker::PhantomData,
         };
 
@@ -548,8 +592,7 @@ mod tests {
             next_stream_id: AtomicU32::new(2),
             is_client: false,
             frame_tx: flume::bounded(1).0,
-            die: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: SessionState::new(1024),
             _transport: std::marker::PhantomData,
         };
 
@@ -568,8 +611,7 @@ mod tests {
             next_stream_id: AtomicU32::new(u32::MAX - 1),
             is_client: true,
             frame_tx: flume::bounded(1).0,
-            die: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: SessionState::new(1024),
             _transport: std::marker::PhantomData,
         };
         assert!(inner.next_stream_id().is_err());
@@ -585,8 +627,7 @@ mod tests {
             next_stream_id: AtomicU32::new(1),
             is_client: true,
             frame_tx: flume::bounded(1).0,
-            die: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: SessionState::new(1024),
             _transport: std::marker::PhantomData,
         };
         let server_inner = SessionInner::<tokio::io::DuplexStream> {
@@ -597,8 +638,7 @@ mod tests {
             next_stream_id: AtomicU32::new(2),
             is_client: false,
             frame_tx: flume::bounded(1).0,
-            die: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: SessionState::new(1024),
             _transport: std::marker::PhantomData,
         };
 
