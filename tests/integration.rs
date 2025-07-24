@@ -35,7 +35,7 @@ test_with_timeout!(test_basic_data_transfer, 30, {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Server accepts the stream
-    let mut server_stream = server_session.accept_stream().await?.unwrap();
+    let mut server_stream = server_session.accept_stream().await?;
 
     // Verify stream IDs match
     assert_eq!(client_stream.stream_id(), server_stream.stream_id());
@@ -69,7 +69,7 @@ test_with_timeout!(test_bidirectional_transfer, 30, {
     // Establish stream connection
     let client_stream = client_session.open_stream().await?;
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let server_stream = server_session.accept_stream().await?.unwrap();
+    let server_stream = server_session.accept_stream().await?;
 
     // Spawn tasks for concurrent bidirectional communication
     let client_data = b"Client -> Server";
@@ -153,7 +153,7 @@ test_with_timeout!(test_multiple_concurrent_streams, 30, {
 
     // Accept and handle streams on server side
     for _ in 0..NUM_STREAMS {
-        let server_stream = server_session.accept_stream().await?.unwrap();
+        let server_stream = server_session.accept_stream().await?;
         server_tasks.push(tokio::spawn({
             let mut stream = server_stream;
             async move {
@@ -193,7 +193,7 @@ test_with_timeout!(test_session_close, 30, {
     // Open a stream
     let mut client_stream = client_session.open_stream().await?;
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let mut server_stream = server_session.accept_stream().await?.unwrap();
+    let mut server_stream = server_session.accept_stream().await?;
 
     // Write some data
     client_stream.write_all(b"test data").await?;
@@ -229,7 +229,7 @@ test_with_timeout!(test_stream_close, 30, {
     // Establish stream
     let mut client_stream = client_session.open_stream().await?;
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let mut server_stream = server_session.accept_stream().await?.unwrap();
+    let mut server_stream = server_session.accept_stream().await?;
 
     // Client sends data then closes write side
     client_stream.write_all(b"closing after this").await?;
@@ -266,7 +266,7 @@ test_with_timeout!(test_peer_disconnect, 30, {
     // Establish stream
     let mut client_stream = client_session.open_stream().await?;
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let mut server_stream = server_session.accept_stream().await?.unwrap();
+    let mut server_stream = server_session.accept_stream().await?;
 
     // Send some data
     client_stream.write_all(b"test").await?;

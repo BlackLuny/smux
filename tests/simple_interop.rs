@@ -473,7 +473,7 @@ test_with_timeout!(test_rust_server_go_client, 20, {
                             let mut stream_count = 0;
                             loop {
                                 match server_session.accept_stream().await {
-                                    Ok(Some(stream)) => {
+                                    Ok(stream) => {
                                         stream_count += 1;
                                         println!("📥 Accepted stream {stream_count}");
 
@@ -491,12 +491,8 @@ test_with_timeout!(test_rust_server_go_client, 20, {
                                             break;
                                         }
                                     }
-                                    Ok(None) => {
+                                    Err(_) => {
                                         println!("No more streams available");
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        println!("Stream accept error: {e}");
                                         break;
                                     }
                                 }
@@ -620,7 +616,7 @@ test_with_timeout!(test_bidirectional_multi_stream, 25, {
                             )
                             .await
                             {
-                                Ok(Ok(Some(stream))) => {
+                                Ok(Ok(stream)) => {
                                     handled_streams += 1;
                                     println!("📥 Accepted stream {handled_streams} in Phase 2");
 
@@ -632,12 +628,8 @@ test_with_timeout!(test_bidirectional_multi_stream, 25, {
                                         }
                                     });
                                 }
-                                Ok(Ok(None)) => {
+                                Ok(Err(_)) => {
                                     println!("📄 No more streams available in Phase 2");
-                                    break;
-                                }
-                                Ok(Err(e)) => {
-                                    println!("❌ Stream accept error in Phase 2: {e}");
                                     break;
                                 }
                                 Err(_) => {

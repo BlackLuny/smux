@@ -173,9 +173,9 @@ where
     }
 
     /// Accept an incoming stream initiated by the peer
-    pub async fn accept_stream(&self) -> Result<Option<Stream>> {
+    pub async fn accept_stream(&self) -> Result<Stream> {
         if self.inner.closed.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(None);
+            return Err(SmuxError::SessionClosed);
         }
 
         let rx = &self.inner.incoming_streams_rx;
@@ -183,11 +183,11 @@ where
         tokio::select! {
             result = rx.recv_async() => {
                 match result {
-                    Ok(stream) => Ok(Some(stream)),
-                    Err(_) => Ok(None), // Channel is closed
+                    Ok(stream) => Ok(stream),
+                    Err(_) => Err(SmuxError::SessionClosed),
                 }
             },
-            _ = self.inner.die.notified() => Ok(None),
+            _ = self.inner.die.notified() => Err(SmuxError::SessionClosed),
         }
     }
 
@@ -478,9 +478,9 @@ mod tests {
         session.close().await.unwrap();
         assert!(session.is_closed());
 
-        // Should return None after close
-        let result = session.accept_stream().await.unwrap();
-        assert!(result.is_none());
+        // Should return Error after close
+        let result = session.accept_stream().await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

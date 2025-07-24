@@ -129,12 +129,7 @@ fn bench_conn_smux(c: &mut Criterion) {
             || {
                 rt.block_on(async {
                     let client_stream = client_session.clone().open_stream().await.unwrap();
-                    let server_stream = server_session
-                        .clone()
-                        .accept_stream()
-                        .await
-                        .unwrap()
-                        .unwrap();
+                    let server_stream = server_session.clone().accept_stream().await.unwrap();
                     let write_buf = vec![42u8; CHUNK_SIZE];
                     let read_buf = vec![0u8; CHUNK_SIZE];
                     (client_stream, server_stream, write_buf, read_buf)

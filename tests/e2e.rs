@@ -45,7 +45,7 @@ test_with_timeout!(test_e2e_basic_tcp_communication, 30, {
             let server_session = Session::server(socket, config).await.unwrap();
 
             // Accept a stream
-            let mut server_stream = server_session.accept_stream().await.unwrap().unwrap();
+            let mut server_stream = server_session.accept_stream().await.unwrap();
 
             // Read "hello"
             let mut buffer = [0u8; 5];
@@ -102,7 +102,7 @@ test_with_timeout!(test_e2e_multiple_streams_tcp, 30, {
             // Handle multiple streams
             let mut tasks = Vec::new();
             for i in 0..NUM_STREAMS {
-                let server_stream = server_session.accept_stream().await.unwrap().unwrap();
+                let server_stream = server_session.accept_stream().await.unwrap();
                 let task = tokio::spawn(async move {
                     let mut stream = server_stream;
 
@@ -190,7 +190,7 @@ test_with_timeout!(test_e2e_large_data_transfer, 30, {
             let server_session = Session::server(socket, config).await.unwrap();
 
             // Accept stream
-            let mut server_stream = server_session.accept_stream().await.unwrap().unwrap();
+            let mut server_stream = server_session.accept_stream().await.unwrap();
 
             // Read all data
             let mut received_data = Vec::new();
@@ -276,7 +276,7 @@ test_with_timeout!(test_e2e_connection_handling, 30, {
             let server_session = Session::server(socket, config).await.unwrap();
 
             // Accept stream but don't do anything - let client disconnect
-            let _server_stream = server_session.accept_stream().await.unwrap().unwrap();
+            let _server_stream = server_session.accept_stream().await.unwrap();
 
             // Wait a bit then try to accept another stream (should fail due to disconnect)
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -287,10 +287,9 @@ test_with_timeout!(test_e2e_connection_handling, 30, {
 
             // Should either timeout or return None due to session close
             match result {
-                Ok(Ok(None)) => {} // Session closed gracefully
-                Ok(Ok(Some(_))) => panic!("Unexpected stream after client disconnect"),
-                Ok(Err(_)) => {} // Error is acceptable
-                Err(_) => {}     // Timeout is acceptable
+                Ok(Err(_)) => {} // Session closed gracefully
+                Ok(Ok(_)) => panic!("Unexpected stream after client disconnect"),
+                Err(_) => {} // Timeout is acceptable
             }
         }
     });

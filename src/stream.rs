@@ -441,7 +441,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Server accepts the stream
-        let mut server_stream = server_session.accept_stream().await.unwrap().unwrap();
+        let mut server_stream = server_session.accept_stream().await.unwrap();
 
         // Verify stream IDs match
         assert_eq!(client_stream.stream_id(), server_stream.stream_id());
