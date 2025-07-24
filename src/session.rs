@@ -84,16 +84,7 @@ impl SessionState {
     }
 
     pub fn close(&self) {
-        if self
-            .closed
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
-        {
+        if !self.closed.swap(true, std::sync::atomic::Ordering::Relaxed) {
             self.die.notify_waiters();
         }
     }
