@@ -40,13 +40,13 @@ pub(crate) struct SessionState {
 
 /// A multiplexed session that manages multiple streams over a single connection
 #[derive(Debug)]
-pub struct Session<T> {
-    inner: Arc<SessionInner<T>>,
+pub struct Session {
+    inner: Arc<SessionInner>,
 }
 
 /// Internal session state shared between tasks
 #[derive(Debug)]
-struct SessionInner<T> {
+struct SessionInner {
     /// Active streams mapped by stream ID to their state
     streams: DashMap<u32, StreamState>,
     /// Session configuration
@@ -63,8 +63,6 @@ struct SessionInner<T> {
     frame_tx: flume::Sender<Frame>,
     /// Session state passed to Streams
     state: SessionState,
-    /// Transport type marker
-    _transport: std::marker::PhantomData<T>,
 }
 
 impl SessionState {
@@ -134,7 +132,7 @@ impl Clone for SessionState {
     }
 }
 
-impl<T> Clone for Session<T> {
+impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -142,22 +140,29 @@ impl<T> Clone for Session<T> {
     }
 }
 
-impl<T> Session<T>
-where
-    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-{
+impl Session {
     /// Create a new client session
-    pub async fn client(transport: T, config: Config) -> Result<Self> {
+    pub async fn client(
+        transport: impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+        config: Config,
+    ) -> Result<Self> {
         Self::new(transport, config, true).await
     }
 
     /// Create a new server session
-    pub async fn server(transport: T, config: Config) -> Result<Self> {
+    pub async fn server(
+        transport: impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+        config: Config,
+    ) -> Result<Self> {
         Self::new(transport, config, false).await
     }
 
     /// Internal constructor for both client and server sessions
-    async fn new(transport: T, config: Config, is_client: bool) -> Result<Self> {
+    async fn new(
+        transport: impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+        config: Config,
+        is_client: bool,
+    ) -> Result<Self> {
         let config = Arc::new(config);
         let codec = Codec::new((*config).clone());
         let framed = Framed::new(transport, codec);
@@ -180,7 +185,6 @@ where
             is_client,
             frame_tx,
             state: SessionState::new(config.max_receive_buffer),
-            _transport: std::marker::PhantomData,
         });
 
         let session = Session {
@@ -280,7 +284,7 @@ where
     }
 }
 
-impl<T> SessionInner<T> {
+impl SessionInner {
     /// Get the next available stream ID
     fn next_stream_id(&self) -> Result<u32> {
         let current = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
@@ -312,7 +316,7 @@ impl<T> SessionInner<T> {
 /// Background task that reads frames from the transport and dispatches them
 async fn recv_loop<T>(
     mut stream: futures::stream::SplitStream<Framed<T, Codec>>,
-    inner: Arc<SessionInner<T>>,
+    inner: Arc<SessionInner>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
@@ -353,7 +357,7 @@ where
 async fn send_loop<T>(
     mut sink: futures::stream::SplitSink<Framed<T, Codec>, Frame>,
     frame_rx: flume::Receiver<Frame>,
-    inner: Arc<SessionInner<T>>,
+    inner: Arc<SessionInner>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
@@ -388,10 +392,7 @@ where
 }
 
 /// Handle an incoming frame based on its command type
-async fn handle_frame<T>(frame: Frame, inner: &Arc<SessionInner<T>>) -> Result<()>
-where
-    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-{
+async fn handle_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()> {
     match frame.cmd {
         Command::Syn => handle_syn_frame(frame, inner).await,
         Command::Fin => handle_fin_frame(frame, inner).await,
@@ -405,10 +406,7 @@ where
 }
 
 /// Handle SYN frame (new stream from peer)
-async fn handle_syn_frame<T>(frame: Frame, inner: &Arc<SessionInner<T>>) -> Result<()>
-where
-    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-{
+async fn handle_syn_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()> {
     let stream_id = frame.stream_id;
 
     // Validate peer stream ID
@@ -451,10 +449,7 @@ where
 }
 
 /// Handle FIN frame (stream close)
-async fn handle_fin_frame<T>(frame: Frame, inner: &Arc<SessionInner<T>>) -> Result<()>
-where
-    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-{
+async fn handle_fin_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()> {
     let stream_id = frame.stream_id;
 
     // Find the stream and mark it as read-closed
@@ -470,10 +465,7 @@ where
 }
 
 /// Handle PSH frame (data)
-async fn handle_psh_frame<T>(frame: Frame, inner: &Arc<SessionInner<T>>) -> Result<()>
-where
-    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-{
+async fn handle_psh_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()> {
     let stream_id = frame.stream_id;
     let data_len = frame.data.len();
 
@@ -524,10 +516,7 @@ where
 }
 
 /// Handle UPD frame (flow control update)
-async fn handle_upd_frame<T>(frame: Frame, _inner: &Arc<SessionInner<T>>) -> Result<()>
-where
-    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
-{
+async fn handle_upd_frame(frame: Frame, _inner: &Arc<SessionInner>) -> Result<()> {
     let _stream_id = frame.stream_id;
 
     // Extract window from UPD frame
@@ -624,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_client_stream_id_generation() {
-        let inner = SessionInner::<tokio::io::DuplexStream> {
+        let inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
             incoming_streams_tx: flume::bounded(1).0,
@@ -633,7 +622,6 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            _transport: std::marker::PhantomData,
         };
 
         assert_eq!(inner.next_stream_id().unwrap(), 1);
@@ -643,7 +631,7 @@ mod tests {
 
     #[test]
     fn test_server_stream_id_generation() {
-        let inner = SessionInner::<tokio::io::DuplexStream> {
+        let inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
             incoming_streams_tx: flume::bounded(1).0,
@@ -652,7 +640,6 @@ mod tests {
             is_client: false,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            _transport: std::marker::PhantomData,
         };
 
         assert_eq!(inner.next_stream_id().unwrap(), 2);
@@ -662,7 +649,7 @@ mod tests {
 
     #[test]
     fn test_stream_id_overflow() {
-        let inner = SessionInner::<tokio::io::DuplexStream> {
+        let inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
             incoming_streams_tx: flume::bounded(1).0,
@@ -671,14 +658,13 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            _transport: std::marker::PhantomData,
         };
         assert!(inner.next_stream_id().is_err());
     }
 
     #[test]
     fn test_peer_stream_id_validation() {
-        let client_inner = SessionInner::<tokio::io::DuplexStream> {
+        let client_inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
             incoming_streams_tx: flume::bounded(1).0,
@@ -687,9 +673,8 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            _transport: std::marker::PhantomData,
         };
-        let server_inner = SessionInner::<tokio::io::DuplexStream> {
+        let server_inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
             incoming_streams_tx: flume::bounded(1).0,
@@ -698,7 +683,6 @@ mod tests {
             is_client: false,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            _transport: std::marker::PhantomData,
         };
 
         assert!(client_inner.validate_peer_stream_id(2).is_ok());

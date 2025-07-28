@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 // Match Go benchmark: 128KB chunks
 const CHUNK_SIZE: usize = 128 * 1024; // 128KB to match Go benchmark
 
-async fn create_tcp_session_pair() -> (Arc<Session<TcpStream>>, Arc<Session<TcpStream>>) {
+async fn create_tcp_session_pair() -> (Arc<Session>, Arc<Session>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
