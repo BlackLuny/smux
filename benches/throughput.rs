@@ -1,5 +1,5 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use smux::{Config, Session};
+use smux::{Config, ConfigBuilder, Session};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -13,7 +13,11 @@ async fn create_tcp_session_pair() -> (Arc<Session>, Arc<Session>) {
 
     let server_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let config = Config::default();
+        let config = ConfigBuilder::new()
+            .max_frame_size(32768)
+            .max_receive_buffer(32 * 1024 * 1024)
+            .build()
+            .unwrap_or_default();
         Session::server(stream, config).await.unwrap()
     });
 
