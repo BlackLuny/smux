@@ -11,23 +11,14 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Notify,
-    time::{Duration, interval},
+    time::interval,
 };
 use tokio_util::codec::Framed;
-
-/// Get current Unix timestamp in milliseconds
-fn current_unix_timestamp_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// Stream state tracked by the session for each active stream
 #[derive(Debug)]
@@ -46,6 +37,8 @@ pub(crate) struct SessionState {
     tokens: Arc<AtomicI64>,
     /// Notified when tokens are returned by streams
     tokens_returned: Arc<Notify>,
+    /// Flag indicating if data has been received since last keepalive check
+    data_received: Arc<AtomicBool>,
 }
 
 /// A multiplexed session that manages multiple streams over a single connection
@@ -73,10 +66,6 @@ struct SessionInner {
     frame_tx: flume::Sender<Frame>,
     /// Session state passed to Streams
     state: SessionState,
-    /// Last time a frame was received (Unix timestamp in milliseconds)
-    last_recv_time: AtomicU64,
-    /// Last time a frame was sent (Unix timestamp in milliseconds)
-    last_send_time: AtomicU64,
 }
 
 impl SessionState {
@@ -87,6 +76,7 @@ impl SessionState {
             closed: Arc::new(AtomicBool::new(false)),
             tokens: Arc::new(AtomicI64::new(buffer_size as i64)),
             tokens_returned: Arc::new(Notify::new()),
+            data_received: Arc::new(AtomicBool::new(true)), // Start with true to avoid immediate timeout
         }
     }
 
@@ -123,6 +113,16 @@ impl SessionState {
     pub fn tokens_returned_notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.tokens_returned)
     }
+
+    /// Mark that data has been received
+    pub fn mark_data_received(&self) {
+        self.data_received.store(true, Ordering::Relaxed);
+    }
+
+    /// Check and reset data received flag (returns previous value)
+    pub fn check_and_reset_data_received(&self) -> bool {
+        self.data_received.swap(false, Ordering::Relaxed)
+    }
 }
 
 impl Clone for SessionState {
@@ -132,6 +132,7 @@ impl Clone for SessionState {
             closed: Arc::clone(&self.closed),
             tokens: Arc::clone(&self.tokens),
             tokens_returned: Arc::clone(&self.tokens_returned),
+            data_received: Arc::clone(&self.data_received),
         }
     }
 }
@@ -180,7 +181,6 @@ impl Session {
         let initial_id = if is_client { 1 } else { 2 };
 
         // Create session inner
-        let current_time = current_unix_timestamp_millis();
         let inner = Arc::new(SessionInner {
             streams: DashMap::new(),
             config: Arc::clone(&config),
@@ -190,8 +190,6 @@ impl Session {
             is_client,
             frame_tx,
             state: SessionState::new(config.max_receive_buffer),
-            last_recv_time: AtomicU64::new(current_time),
-            last_send_time: AtomicU64::new(current_time),
         });
 
         let session = Session {
@@ -342,8 +340,8 @@ where
             frame_result = stream.next() => {
                 match frame_result {
                     Some(Ok(frame)) => {
-                        // Update last received time
-                        inner.last_recv_time.store(current_unix_timestamp_millis(), Ordering::Relaxed);
+                        // Mark that data has been received for keep-alive
+                        inner.state.mark_data_received();
 
                         if let Err(e) = handle_frame(frame, &inner).await {
                             tracing::error!("Error handling frame: {}", e);
@@ -390,8 +388,6 @@ where
                             tracing::error!("Frame send error: {}", e);
                             break;
                         }
-                        // Update last sent time after successful send
-                        inner.last_send_time.store(current_unix_timestamp_millis(), Ordering::Relaxed);
                     }
                     Err(_) => {
                         tracing::info!("Frame sender closed");
@@ -561,44 +557,33 @@ async fn keep_alive_loop(inner: Arc<SessionInner>) -> Result<()> {
         return Ok(());
     }
 
-    let mut interval = interval(Duration::from_millis(10)); // Check every 10ms for responsiveness
+    let mut ping_interval = interval(inner.config.keep_alive_interval);
+    let mut timeout_interval = interval(inner.config.keep_alive_timeout);
     let close_notifier = inner.state.close_notifier();
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                let current_time = current_unix_timestamp_millis();
-
-                // Check if we should send a NOP frame to keep connection alive
-                let last_send = inner.last_send_time.load(Ordering::Relaxed);
-                let send_idle_time = current_time.saturating_sub(last_send);
-
-                if send_idle_time >= inner.config.keep_alive_interval.as_millis() as u64 {
-                    // Send NOP frame to keep connection alive
-                    let nop_frame = Frame::new_nop(inner.config.version);
-                    if inner.frame_tx.send_async(nop_frame).await.is_err() {
-                        // Frame channel closed, session is shutting down
-                        break;
-                    }
-                    // Update send time after successful send
-                    inner.last_send_time.store(current_time, Ordering::Relaxed);
+            _ = ping_interval.tick() => {
+                // Send NOP frame to keep connection alive
+                let nop_frame = Frame::new_nop(inner.config.version);
+                if inner.frame_tx.send_async(nop_frame).await.is_err() {
+                    // Frame channel closed, session is shutting down
+                    tracing::info!("keep_alive_loop: frame channel closed");
+                    break;
                 }
-
-                // Check for receive timeout
-                let last_recv = inner.last_recv_time.load(Ordering::Relaxed);
-                let recv_idle_time = current_time.saturating_sub(last_recv);
-
-                if recv_idle_time >= inner.config.keep_alive_timeout.as_millis() as u64 {
-                    // Check flow control tokens before deciding to close
-                    let available_tokens = inner.state.tokens.load(Ordering::Relaxed);
-                    let min_frame_size = inner.config.max_frame_size as i64;
+                tracing::debug!("Sent keep-alive NOP frame");
+            }
+            _ = timeout_interval.tick() => {
+                // Check if data was received since last timeout check
+                if !inner.state.check_and_reset_data_received() {
+                    // No data received, check flow control tokens before deciding to close
+                    let available_tokens = inner.state.get_tokens();
 
                     // Only close if we have enough tokens to receive a frame
                     // If tokens are low, the peer might be unable to send, so don't timeout
-                    if available_tokens >= min_frame_size {
+                    if available_tokens > 0  {
                         tracing::warn!(
-                            "Keep-alive timeout: no data received for {}ms (tokens: {})",
-                            recv_idle_time,
+                            "Keep-alive timeout: no data received (tokens: {})",
                             available_tokens
                         );
                         inner.state.close();
@@ -609,6 +594,8 @@ async fn keep_alive_loop(inner: Arc<SessionInner>) -> Result<()> {
                             available_tokens
                         );
                     }
+                } else {
+                    tracing::debug!("Data received, keep-alive timeout reset");
                 }
             }
             _ = close_notifier.notified() => {
@@ -624,6 +611,7 @@ async fn keep_alive_loop(inner: Arc<SessionInner>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::Duration;
 
     fn test_config() -> Config {
         Config::default()
@@ -703,7 +691,6 @@ mod tests {
 
     #[test]
     fn test_client_stream_id_generation() {
-        let current_time = current_unix_timestamp_millis();
         let inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
@@ -713,8 +700,6 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            last_recv_time: AtomicU64::new(current_time),
-            last_send_time: AtomicU64::new(current_time),
         };
 
         assert_eq!(inner.next_stream_id().unwrap(), 1);
@@ -724,7 +709,6 @@ mod tests {
 
     #[test]
     fn test_server_stream_id_generation() {
-        let current_time = current_unix_timestamp_millis();
         let inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
@@ -734,8 +718,6 @@ mod tests {
             is_client: false,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            last_recv_time: AtomicU64::new(current_time),
-            last_send_time: AtomicU64::new(current_time),
         };
 
         assert_eq!(inner.next_stream_id().unwrap(), 2);
@@ -745,7 +727,6 @@ mod tests {
 
     #[test]
     fn test_stream_id_overflow() {
-        let current_time = current_unix_timestamp_millis();
         let inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
@@ -755,15 +736,12 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            last_recv_time: AtomicU64::new(current_time),
-            last_send_time: AtomicU64::new(current_time),
         };
         assert!(inner.next_stream_id().is_err());
     }
 
     #[test]
     fn test_peer_stream_id_validation() {
-        let current_time = current_unix_timestamp_millis();
         let client_inner = SessionInner {
             streams: DashMap::new(),
             config: Arc::new(test_config()),
@@ -773,8 +751,6 @@ mod tests {
             is_client: true,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            last_recv_time: AtomicU64::new(current_time),
-            last_send_time: AtomicU64::new(current_time),
         };
         let server_inner = SessionInner {
             streams: DashMap::new(),
@@ -785,8 +761,6 @@ mod tests {
             is_client: false,
             frame_tx: flume::bounded(1).0,
             state: SessionState::new(1024),
-            last_recv_time: AtomicU64::new(current_time),
-            last_send_time: AtomicU64::new(current_time),
         };
 
         assert!(client_inner.validate_peer_stream_id(2).is_ok());
