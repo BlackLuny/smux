@@ -34,6 +34,8 @@ pub(crate) struct SessionState {
     closed: Arc<AtomicBool>,
     /// Tokens available for flow control
     tokens: Arc<AtomicI64>,
+    /// Notified when tokens are returned by streams
+    tokens_returned: Arc<Notify>,
 }
 
 /// A multiplexed session that manages multiple streams over a single connection
@@ -72,6 +74,7 @@ impl SessionState {
             die: Arc::new(Notify::new()),
             closed: Arc::new(AtomicBool::new(false)),
             tokens: Arc::new(AtomicI64::new(buffer_size as i64)),
+            tokens_returned: Arc::new(Notify::new()),
         }
     }
 
@@ -88,6 +91,36 @@ impl SessionState {
             self.die.notify_waiters();
         }
     }
+
+    /// Return tokens to the session and notify waiters
+    pub fn return_tokens(&self, count: usize) {
+        self.tokens.fetch_add(count as i64, Ordering::Relaxed);
+        self.tokens_returned.notify_waiters();
+    }
+
+    /// Try to consume tokens for flow control
+    pub fn try_consume_tokens(&self, count: usize) -> bool {
+        let mut current = self.tokens.load(Ordering::Relaxed);
+        loop {
+            if current < count as i64 {
+                return false;
+            }
+            match self.tokens.compare_exchange_weak(
+                current,
+                current - count as i64,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Get tokens returned notifier
+    pub fn tokens_returned_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.tokens_returned)
+    }
 }
 
 impl Clone for SessionState {
@@ -96,6 +129,7 @@ impl Clone for SessionState {
             die: Arc::clone(&self.die),
             closed: Arc::clone(&self.closed),
             tokens: Arc::clone(&self.tokens),
+            tokens_returned: Arc::clone(&self.tokens_returned),
         }
     }
 }
@@ -441,16 +475,50 @@ where
     T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
     let stream_id = frame.stream_id;
+    let data_len = frame.data.len();
+
+    if data_len == 0 {
+        return Ok(()); // Empty frame, nothing to do
+    }
+
+    // Wait for available tokens
+    let tokens_notifier = inner.state.tokens_returned_notifier();
+    let close_notifier = inner.state.close_notifier();
+    loop {
+        if inner.state.try_consume_tokens(data_len) {
+            break;
+        }
+
+        // No tokens available, wait for streams to consume data and return tokens
+        tokio::select! {
+            _ = tokens_notifier.notified() => {
+                // Try again after notification
+                continue;
+            }
+            _ = close_notifier.notified() => {
+                // Session is closing, drop the frame
+                return Ok(());
+            }
+        }
+    }
 
     // Find the stream and send data to it
     if let Some(stream_state) = inner.streams.get(&stream_id) {
-        if !frame.data.is_empty() && stream_state.data_tx.try_send(frame.data).is_err() {
-            // Stream receiver is closed, remove from map
-            drop(stream_state);
-            inner.streams.remove(&stream_id);
+        match stream_state.data_tx.send_async(frame.data).await {
+            Ok(_) => {
+                // Data successfully sent to stream
+            }
+            Err(_) => {
+                // Stream receiver is closed, return tokens and remove from map
+                inner.state.return_tokens(data_len);
+                drop(stream_state);
+                inner.streams.remove(&stream_id);
+            }
         }
+    } else {
+        // Stream not found, return tokens (could be for a closed stream)
+        inner.state.return_tokens(data_len);
     }
-    // If stream not found, ignore the frame (could be for a closed stream)
 
     Ok(())
 }

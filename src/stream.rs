@@ -117,6 +117,9 @@ impl AsyncRead for Stream {
                 let data = chunk.split_to(to_copy);
                 buf.put_slice(&data);
 
+                // Return tokens for consumed data
+                this.session_state.return_tokens(to_copy);
+
                 // If chunk is now empty, remove it
                 if chunk.is_empty() {
                     this.current_chunk = None;
@@ -132,6 +135,9 @@ impl AsyncRead for Stream {
                 if to_copy > 0 {
                     let data = chunk.split_to(to_copy);
                     buf.put_slice(&data);
+
+                    // Return tokens for consumed data
+                    this.session_state.return_tokens(to_copy);
 
                     if !chunk.is_empty() {
                         this.current_chunk = Some(chunk);
