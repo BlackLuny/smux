@@ -1,6 +1,36 @@
 use crate::error::{Result, SmuxError};
 use std::time::Duration;
 
+/// Configuration for a smux session.
+///
+/// `Config` contains all the tunable parameters for a smux session, including
+/// keep-alive settings, buffer sizes, and protocol version.
+///
+/// # Examples
+///
+/// ## Using default configuration
+///
+/// ```rust
+/// use smux::Config;
+///
+/// let config = Config::default();
+/// assert_eq!(config.version, 1);
+/// assert!(config.enable_keep_alive);
+/// ```
+///
+/// ## Creating custom configuration
+///
+/// ```rust
+/// use smux::{Config, ConfigBuilder};
+/// use std::time::Duration;
+///
+/// let config = ConfigBuilder::new()
+///     .version(2)
+///     .keep_alive_interval(Duration::from_secs(30))
+///     .max_frame_size(64 * 1024)
+///     .build()
+///     .expect("Valid configuration");
+/// ```
 #[derive(Debug, Clone)]
 pub struct Config {
     pub version: u8,
@@ -64,6 +94,26 @@ impl Config {
     }
 }
 
+/// Builder for creating custom `Config` instances.
+///
+/// `ConfigBuilder` provides a fluent interface for constructing `Config` objects
+/// with custom parameters. It starts with default values and allows selective
+/// overriding of specific settings.
+///
+/// # Examples
+///
+/// ```rust
+/// use smux::ConfigBuilder;
+/// use std::time::Duration;
+///
+/// let config = ConfigBuilder::new()
+///     .version(2)
+///     .keep_alive_interval(Duration::from_secs(30))
+///     .max_frame_size(64 * 1024)
+///     .enable_keep_alive(false)
+///     .build()
+///     .expect("Valid configuration");
+/// ```
 pub struct ConfigBuilder {
     config: Config,
 }

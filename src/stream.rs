@@ -16,7 +16,43 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// A multiplexed stream within a smux session
+/// A multiplexed stream within a smux session.
+///
+/// `Stream` represents a single logical stream within a multiplexed session.
+/// It implements `AsyncRead` and `AsyncWrite` for seamless integration with
+/// tokio-based applications.
+///
+/// Streams are created through `Session::open_stream()` (client side) or
+/// `Session::accept_stream()` (server side). Each stream provides independent,
+/// bidirectional communication over the shared underlying connection.
+///
+/// # Examples
+///
+/// ## Using a stream for reading and writing
+///
+/// ```rust,no_run
+/// use smux::{Config, Session};
+/// use tokio::net::TcpStream;
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let conn = TcpStream::connect("127.0.0.1:8080").await?;
+///     let mut session = Session::client(conn, Config::default()).await?;
+///     
+///     let mut stream = session.open_stream().await?;
+///     
+///     // Write some data
+///     stream.write_all(b"Hello, world!").await?;
+///     
+///     // Read the response
+///     let mut buffer = vec![0; 1024];
+///     let n = stream.read(&mut buffer).await?;
+///     println!("Read {} bytes: {:?}", n, &buffer[..n]);
+///     
+///     Ok(())
+/// }
+/// ```
 ///
 /// Implements AsyncRead and AsyncWrite for seamless integration with tokio.
 #[derive(Debug)]
@@ -264,7 +300,7 @@ impl Drop for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Command;
+    use crate::command::Command;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]

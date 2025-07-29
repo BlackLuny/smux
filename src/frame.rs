@@ -41,6 +41,7 @@ impl Frame {
         Self::new(version, Command::Nop, 0, Bytes::new())
     }
 
+    #[allow(dead_code)]
     pub fn new_upd(version: u8, stream_id: u32, consumed: u32, window: u32) -> Self {
         Self::new(
             version,
@@ -54,10 +55,12 @@ impl Frame {
         HEADER_SIZE + self.data.len()
     }
 
+    #[allow(dead_code)]
     pub fn data_len(&self) -> usize {
         self.data.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -114,10 +117,12 @@ impl Frame {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn consumed(&self) -> Option<u32> {
         self.cmd.consumed()
     }
 
+    #[allow(dead_code)]
     pub fn window(&self) -> Option<u32> {
         self.cmd.window()
     }

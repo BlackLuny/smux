@@ -1,6 +1,6 @@
 use crate::{
-    Command,
     codec::Codec,
+    command::Command,
     config::Config,
     error::{Result, SmuxError},
     frame::Frame,
@@ -41,7 +41,52 @@ pub(crate) struct SessionState {
     data_received: Arc<AtomicBool>,
 }
 
-/// A multiplexed session that manages multiple streams over a single connection
+/// A multiplexed session that manages multiple streams over a single connection.
+///
+/// The `Session` provides the main interface for creating and managing multiple logical
+/// streams over a single underlying connection. It handles frame multiplexing, flow control,
+/// and keep-alive functionality.
+///
+/// # Examples
+///
+/// ## Creating a client session
+///
+/// ```rust,no_run
+/// use smux::{Config, Session};
+/// use tokio::net::TcpStream;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let conn = TcpStream::connect("127.0.0.1:8080").await?;
+///     let config = Config::default();
+///     let mut session = Session::client(conn, config).await?;
+///     
+///     let mut stream = session.open_stream().await?;
+///     // Use stream...
+///     Ok(())
+/// }
+/// ```
+///
+/// ## Creating a server session
+///
+/// ```rust,no_run
+/// use smux::{Config, Session};
+/// use tokio::net::TcpListener;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let listener = TcpListener::bind("127.0.0.1:8080").await?;
+///     let (conn, _) = listener.accept().await?;
+///     
+///     let config = Config::default();
+///     let mut session = Session::server(conn, config).await?;
+///     
+///     while let Ok(mut stream) = session.accept_stream().await {
+///         // Handle incoming stream...
+///     }
+///     Ok(())
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Session {
     inner: Arc<SessionInner>,
@@ -146,7 +191,29 @@ impl Clone for Session {
 }
 
 impl Session {
-    /// Create a new client session
+    /// Create a new client session over the given transport.
+    ///
+    /// This method establishes a client-side smux session and starts the necessary
+    /// background tasks for handling frames and keep-alive.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - The underlying connection (e.g., TcpStream)
+    /// * `config` - Session configuration
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use smux::{Config, Session};
+    /// use tokio::net::TcpStream;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let conn = TcpStream::connect("127.0.0.1:8080").await?;
+    /// let session = Session::client(conn, Config::default()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn client(
         transport: impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
         config: Config,
@@ -154,7 +221,30 @@ impl Session {
         Self::new(transport, config, true).await
     }
 
-    /// Create a new server session
+    /// Create a new server session over the given transport.
+    ///
+    /// This method establishes a server-side smux session and starts the necessary
+    /// background tasks for handling frames and keep-alive.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - The underlying connection (e.g., TcpStream)
+    /// * `config` - Session configuration
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use smux::{Config, Session};
+    /// use tokio::net::TcpListener;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    /// let (conn, _) = listener.accept().await?;
+    /// let session = Session::server(conn, Config::default()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn server(
         transport: impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
         config: Config,
@@ -223,6 +313,37 @@ impl Session {
     }
 
     /// Open a new outgoing stream
+    /// Open a new outgoing stream.
+    ///
+    /// This method creates a new logical stream within the session. It can only be called
+    /// on the client side of the connection. The server should use `accept_stream()` to
+    /// receive incoming streams.
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `Stream` that implements `AsyncRead` and `AsyncWrite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SmuxError::SessionClosed` if the session has been closed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use smux::{Config, Session};
+    /// use tokio::net::TcpStream;
+    /// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let conn = TcpStream::connect("127.0.0.1:8080").await?;
+    /// let mut session = Session::client(conn, Config::default()).await?;
+    ///
+    /// let mut stream = session.open_stream().await?;
+    /// stream.write_all(b"Hello, world!").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn open_stream(&self) -> Result<Stream> {
         if self.is_closed() {
             return Err(SmuxError::SessionClosed);
@@ -264,6 +385,40 @@ impl Session {
     }
 
     /// Accept an incoming stream initiated by the peer
+    /// Accept an incoming stream from the peer.
+    ///
+    /// This method waits for and returns new streams initiated by the remote peer.
+    /// It should typically be called in a loop on the server side to handle incoming
+    /// stream requests.
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `Stream` that implements `AsyncRead` and `AsyncWrite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SmuxError::SessionClosed` if the session has been closed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use smux::{Config, Session};
+    /// use tokio::net::TcpListener;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    /// let (conn, _) = listener.accept().await?;
+    /// let mut session = Session::server(conn, Config::default()).await?;
+    ///
+    /// while let Ok(stream) = session.accept_stream().await {
+    ///     tokio::spawn(async move {
+    ///         // Handle the stream...
+    ///     });
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn accept_stream(&self) -> Result<Stream> {
         if self.is_closed() {
             return Err(SmuxError::SessionClosed);
@@ -285,13 +440,56 @@ impl Session {
 
     /// Close the session gracefully
     #[inline]
+    /// Close the session.
+    ///
+    /// This gracefully closes the session and all associated streams. After calling
+    /// this method, no new streams can be opened or accepted, and existing streams
+    /// will be closed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use smux::{Config, Session};
+    /// use tokio::net::TcpStream;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let conn = TcpStream::connect("127.0.0.1:8080").await?;
+    /// let session = Session::client(conn, Config::default()).await?;
+    ///
+    /// // Use session...
+    ///
+    /// session.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn close(&self) -> Result<()> {
         self.inner.state.close();
         Ok(())
     }
 
-    /// Check if the session is closed
-    #[inline]
+    /// Check if the session is closed.
+    ///
+    /// Returns `true` if the session has been closed, either by calling `close()`
+    /// or due to an error condition.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use smux::{Config, Session};
+    /// use tokio::net::TcpStream;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let conn = TcpStream::connect("127.0.0.1:8080").await?;
+    /// let session = Session::client(conn, Config::default()).await?;
+    ///
+    /// assert!(!session.is_closed());
+    /// session.close().await?;
+    /// assert!(session.is_closed());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn is_closed(&self) -> bool {
         self.inner.state.is_closed()
     }

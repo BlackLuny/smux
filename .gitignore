@@ -8,3 +8,4 @@ fixtures/go_smux_echo_server.exe
 fixtures/go_smux_client
 fixtures/go_smux_client.exe
 flamegraph.svg
+coverage

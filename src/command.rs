@@ -47,6 +47,7 @@ impl Command {
         )
     }
 
+    #[allow(dead_code)]
     pub fn can_carry_data(self) -> bool {
         matches!(self, Command::Psh)
     }
@@ -55,6 +56,7 @@ impl Command {
         matches!(self, Command::Upd { .. })
     }
 
+    #[allow(dead_code)]
     pub fn consumed(self) -> Option<u32> {
         match self {
             Command::Upd { consumed, .. } => Some(consumed),
@@ -62,6 +64,7 @@ impl Command {
         }
     }
 
+    #[allow(dead_code)]
     pub fn window(self) -> Option<u32> {
         match self {
             Command::Upd { window, .. } => Some(window),

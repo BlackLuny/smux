@@ -1,0 +1,14 @@
+[tool.tarpaulin]
+# Configure tarpaulin
+out = ["Html", "Xml"]
+output-dir = "coverage"
+exclude-files = [
+    "benches/*",
+    "tests/*",
+    "examples/*"
+]
+# Ignore test modules
+ignore-tests = true
+# Target coverage threshold
+fail-under = 70.0
+timeout = 120

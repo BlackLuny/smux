@@ -1,8 +1,13 @@
 use std::io;
 use thiserror::Error;
 
+/// Convenient type alias for `Result<T, SmuxError>`.
 pub type Result<T> = std::result::Result<T, SmuxError>;
 
+/// Error types for the smux library.
+///
+/// `SmuxError` represents all possible error conditions that can occur
+/// when using the smux library, from I/O errors to protocol violations.
 #[derive(Debug, Error)]
 pub enum SmuxError {
     #[error("I/O error: {0}")]
