@@ -4,14 +4,14 @@ version = "0.2.0"
 authors = ["berry <iberryful@gmail.com>"]
 edition = "2024"
 license = "MIT"
-documentation = "https://docs.rs/"
+documentation = "https://docs.rs/smux"
 repository = "https://github.com/iberryful/smux"
 homepage = "https://github.com/iberryful/smux"
-description = "A smux implementation in Rust"
+description = "A stream multiplexing library for Rust, compatible with the Go smux protocol"
 
 readme = "README.md"
-categories = ["development-tools"]
-keywords = []
+categories = ["network-programming", "asynchronous"]
+keywords = ["multiplexing", "stream", "networking", "async", "smux"]
 
 [dependencies]
 anyhow = "1.0.98"
