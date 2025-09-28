@@ -264,7 +264,7 @@ impl Session {
         let (sink, stream) = framed.split();
 
         // Create channels
-        let (frame_tx, frame_rx) = flume::bounded(config.max_receive_buffer);
+        let (frame_tx, frame_rx) = flume::bounded(config.max_receive_channel_buffer_size);
         let (incoming_streams_tx, incoming_streams_rx) = flume::bounded(16);
 
         // Initial stream ID depends on whether we are client or server

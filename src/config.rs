@@ -38,6 +38,7 @@ pub struct Config {
     pub keep_alive_timeout: Duration,
     pub max_frame_size: usize,
     pub max_receive_buffer: usize,
+    pub max_receive_channel_buffer_size: usize,
     pub max_stream_buffer: usize,
     pub enable_keep_alive: bool,
 }
@@ -50,7 +51,8 @@ impl Default for Config {
             keep_alive_timeout: Duration::from_secs(30),
             max_frame_size: 32 * 1024,           // 32KB
             max_receive_buffer: 4 * 1024 * 1024, // 4MB
-            max_stream_buffer: 64 * 1024,        // 64KB
+            max_receive_channel_buffer_size: 512,
+            max_stream_buffer: 64 * 1024, // 64KB
             enable_keep_alive: true,
         }
     }
@@ -147,6 +149,11 @@ impl ConfigBuilder {
 
     pub fn max_receive_buffer(mut self, size: usize) -> Self {
         self.config.max_receive_buffer = size;
+        self
+    }
+
+    pub fn max_receive_channel_buffer_size(mut self, size: usize) -> Self {
+        self.config.max_receive_channel_buffer_size = size;
         self
     }
 
